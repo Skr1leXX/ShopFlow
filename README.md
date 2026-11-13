@@ -1,36 +1,215 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# ShopFlow
 
-## Getting Started
+Интернет-магазин одежды и аксессуаров с личным кабинетом покупателя и панелью администратора. Next.js 16 (App Router) + React 19 + TypeScript + Tailwind CSS 4 + Supabase (PostgreSQL, Auth, Storage).
 
-First, run the development server:
+Проект учебно-демонстрационный: витрина, корзина, заказы, склад и админка работают на реальной базе данных, но **оплата, доставка и уведомления покупателям не подключены** (см. [Что реально, а что демо](#что-реально-а-что-демо)).
+
+> **Статус проверки.** База данных, политики доступа и серверные функции проверены автоматическими тестами на локальном PostgreSQL. TypeScript, ESLint и production build проходят. Приложение целиком (запросы к Supabase, регистрация, оформление заказа, админка) **ещё не прогонялось на живом проекте Supabase**: набор Playwright написан, но запускался только его часть, не требующая бэкенда. Подробности в разделе [Тестирование](#тестирование).
+
+## Содержание
+[Возможности](#возможности) · [Скриншоты](#скриншоты) · [Стек](#стек) · [Архитектура](#архитектура) · [Структура папок](#структура-папок) · [Требования](#требования) · [Быстрый старт](#быстрый-старт) · [Настройка Supabase](#настройка-supabase) · [Storage](#настройка-storage) · [Переменные окружения](#переменные-окружения) · [Миграции](#миграции) · [Тестирование](#тестирование) · [Развёртывание на Vercel](#развёртывание-на-vercel) · [Безопасность](#безопасность) · [Что реально, а что демо](#что-реально-а-что-демо) · [Ограничения и планы](#ограничения-и-планы)
+
+## Возможности
+
+**Покупатель**
+- Главная: баннер, категории, рекомендации, новинки, спецпредложения, преимущества.
+- Каталог: поиск по названию, описанию и бренду; фильтры по категории, цене, размеру, цвету, бренду; сортировка (популярные, новинки, цена); пагинация. Состояние фильтров хранится в URL.
+- Карточка товара: галерея, выбор цвета и размера, наличие и остаток, количество, избранное, похожие товары.
+- Корзина: гостевая (в браузере) и серверная (в БД); слияние при входе; контроль остатков; промокод.
+- Оформление заказа: контакты, адрес, способ доставки и оплаты, итог, подтверждение; защита от двойной отправки.
+- Личный кабинет: профиль, история и детали заказов, избранное, адреса.
+- Регистрация, вход, выход, восстановление пароля, защита приватных страниц.
+
+**Администратор** (`/admin`, только роль `admin`)
+- Dashboard: выручка, заказы, средний чек, клиенты, товары, низкие остатки, график продаж за 30 дней, популярные товары, последние заказы.
+- Товары: поиск, фильтры, сортировка, создание, правка, удаление, фото в Storage, цены и скидки, варианты (размер × цвет), остатки, скрытие.
+- Категории: CRUD, изображение, порядок. Заказы: поиск, фильтры, состав, смена статуса, безопасная отмена с возвратом остатков.
+- Клиенты: поиск, контакты, история заказов, сумма покупок, роль. Склад: приход, списание, журнал движения, предупреждения о низком остатке.
+- Промокоды: процент или сумма, срок, лимит, минимальная сумма. Экспорт CSV товаров и заказов.
+
+## Скриншоты
+
+Скриншоты не приложены: в среде, где готовился релиз, не было подключённого Supabase, а витрина без данных пуста. Файлы появятся после запуска на демо-проекте:
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npm run build && npm start        # в одном окне
+npm run screenshots               # в другом: docs/screenshots/01-home.png … 12-mobile-catalog.png
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Скрипт `scripts/screenshots.mjs` входит под демо-аккаунтами и снимает главную, каталог, товар, корзину, оформление, заказы, Dashboard и разделы админки, а также мобильную версию. После съёмки добавьте нужные изображения в этот раздел.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Стек
+| Слой | Технологии |
+|---|---|
+| Фронтенд | Next.js 16 (App Router, Server Components, Server Actions, `proxy.ts`), React 19, TypeScript, Tailwind CSS 4, Base UI/shadcn-компоненты, Lucide, шрифты Inter и Cormorant Garamond |
+| Бэкенд | Supabase: PostgreSQL (RLS, триггеры, SQL-функции), Auth (email + пароль), Storage |
+| Валидация | Zod на сервере, ограничения и `check` в БД |
+| Тесты | PGlite (PostgreSQL в WASM) для БД, `node:test`, Playwright для e2e |
+| Публикация | Vercel + Supabase, GitHub Actions |
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Архитектура
 
-## Learn More
+```
+Браузер ──► Next.js (Vercel)                          Supabase
+ клиентские   ├─ Server Components: чтение данных ──►  PostgREST ─► PostgreSQL (RLS)
+ компоненты   ├─ Server Actions: все изменения ──────►  Auth (cookie-сессия через @supabase/ssr)
+ (UI, корзина │    └─ проверка роли и zod-валидация     Storage (бакет product-images)
+ гостя)       └─ proxy.ts: обновление сессии, закрытие /account /checkout /admin
+```
 
-To learn more about Next.js, take a look at the following resources:
+Ключевые решения:
+- **Доверие только серверу.** Цены, скидки, доставка и остатки считает база: заказ создаёт единственная функция `place_order` (security definer), прямой `INSERT` в `orders` запрещён RLS. Браузер присылает лишь выбор покупателя.
+- **Атомарность.** `place_order` блокирует остатки, проверяет наличие, списывает, создаёт заказ и позиции, очищает корзину в одной транзакции. Ключ идемпотентности и advisory-блокировка пользователя защищают от повторов.
+- **Разграничение доступа в БД.** RLS на всех таблицах; роль хранится в `profiles.role`, смену роли блокирует триггер. Приложение дополнительно проверяет роль (`requireAdmin`) в layout и в каждом админ-действии, но настоящая защита — RLS.
+- **Журнал склада.** Любое изменение остатка пишет триггер в `inventory_movements`; подделать журнал напрямую нельзя.
+- **Сессия.** Cookie-сессия `@supabase/ssr`; `proxy.ts` обновляет токен и редиректит на `/login?next=…`, `next` проверяется от open redirect.
+- **Без Supabase приложение не падает**: показывает инструкцию по подключению (`/setup`).
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Структура папок
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+```
+shopflow/
+├─ src/
+│  ├─ app/
+│  │  ├─ (shop)/            витрина: главная, catalog, product/[slug], cart, checkout, account/*
+│  │  ├─ (auth)/            login, register, forgot-password, reset-password
+│  │  ├─ admin/             dashboard, products, categories, orders, customers, inventory, promos, settings, export/[kind]
+│  │  ├─ auth/callback/     обмен кода из письма на сессию
+│  │  └─ setup/             инструкция, если Supabase не настроен
+│  ├─ components/           ui/ (базовые), shop/, admin/, layout/, common/ (формы, состояния, подтверждение)
+│  ├─ lib/
+│  │  ├─ supabase/          клиенты (браузер, сервер), proxy, env
+│  │  ├─ data/              чтение данных (catalog, user, admin) и типы
+│  │  ├─ actions/           серверные действия (auth, shop, admin)
+│  │  └─ auth.ts, csv.ts, format.ts, guest-cart.ts
+│  └─ proxy.ts              защита маршрутов и обновление сессии
+├─ supabase/
+│  ├─ migrations/           схема, RLS и функции (5 файлов)
+│  ├─ seed.sql              демо-каталог (генерируется scripts/gen-seed.mjs)
+│  ├─ setup.sql             всё одним файлом для SQL Editor (npm run db:bundle)
+│  └─ tests/                тесты БД на PGlite
+├─ e2e/                     сценарии Playwright
+├─ scripts/                 seed, демо-данные, проверки окружения/секретов/сборки, скриншоты
+├─ docs/DEMO.md             сценарий демонстрации
+└─ .github/workflows/ci.yml
+```
 
-## Deploy on Vercel
+## Требования
+- Node.js ≥ 20.9 (разрабатывалось на Node 26), npm.
+- Аккаунт Supabase (подойдёт бесплатный план) или локальный Supabase (Docker + Supabase CLI).
+- Для e2e: Edge/Chrome или `npx playwright install chromium`.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## Быстрый старт
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+```bash
+git clone <репозиторий> && cd shopflow
+npm ci
+cp .env.example .env.local      # заполните значениями из Supabase (см. ниже)
+npm run check:env               # проверка переменных
+npm run dev                     # http://localhost:3000
+```
+
+Без `.env.local` сайт откроется, но покажет «Подключите Supabase».
+
+## Настройка Supabase
+
+1. **Проект.** supabase.com → New project (для демо создайте отдельный проект).
+2. **База.** Самый простой путь: SQL Editor → вставьте содержимое `supabase/setup.sql` → Run. Он выполняет все миграции и загружает каталог (34 товара, 6 категорий, 336 вариантов, 3 промокода). На пустом проекте выполнять один раз.
+   Через CLI: `supabase link --project-ref <ref>` → `supabase db push`, затем выполните `supabase/seed.sql`.
+3. **Ключи.** Project Settings → API: `Project URL` и `anon`/`publishable` key — в `.env.local`.
+4. **Auth.** Authentication → URL Configuration: *Site URL* = адрес сайта, *Redirect URLs* = `<адрес сайта>/auth/callback` (для локальной работы `http://localhost:3000/auth/callback`; для превью Vercel добавьте `https://*-<команда>.vercel.app/auth/callback`).
+   Authentication → Providers → Email: для продакшена оставьте подтверждение email и подключите свой SMTP (встроенная почта Supabase сильно ограничена по числу писем). Для демо подтверждение можно отключить.
+5. **Первый администратор.** Зарегистрируйтесь на сайте, затем в SQL Editor: `update public.profiles set role = 'admin' where email = 'ваш@email';`.
+   Либо создайте демо-аккаунты скриптом: в `.env.local` добавьте `SUPABASE_SERVICE_ROLE_KEY` (Settings → API → service_role) и `DEMO_PASSWORD`, затем `npm run seed:demo` — создаст `admin@shopflow.demo`, трёх покупателей, адреса, избранное и 8 заказов за последние недели. Ключ нужен только скрипту и не попадает в приложение.
+
+## Настройка Storage
+
+Бакет `product-images` (публичное чтение, лимит 5 МБ, JPG/PNG/WebP/AVIF) и его политики создаёт миграция `…0002_rls_and_functions.sql` — отдельно настраивать ничего не нужно. Загрузка, замена и удаление доступны только администратору (политики на `storage.objects` проверяют `is_admin()`). Фото товаров лежат в `product-images/<id товара>/…`, изображения категорий — в `product-images/categories/<id>/…`. Фото из seed — внешние ссылки Unsplash; хост разрешён в `next.config.ts` (`images.remotePatterns`), как и `*.supabase.co`. Для локального Supabase (`127.0.0.1`) добавьте его хост в `remotePatterns`.
+
+## Переменные окружения
+
+| Переменная | Где | Назначение |
+|---|---|---|
+| `NEXT_PUBLIC_SUPABASE_URL` | приложение | URL проекта Supabase |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | приложение | публичный ключ; безопасен, защищён RLS. **Не** service_role |
+| `NEXT_PUBLIC_SITE_URL` | приложение | адрес сайта для ссылок из писем |
+| `SUPABASE_SERVICE_ROLE_KEY` | только локальные скрипты и e2e | секретный ключ: `seed:demo`, e2e. **Не задавать на Vercel, не коммитить** |
+| `DEMO_PASSWORD` | только `seed:demo`, `screenshots` | пароль демо-аккаунтов |
+
+`npm run check:env` проверяет значения; тот же контроль выполняется перед каждой сборкой (`prebuild`) и **останавливает сборку**, если секретный ключ оказался в публичной переменной.
+
+## Миграции
+
+| Файл | Содержимое |
+|---|---|
+| `20261108000001_schema.sql` | 13 таблиц (`profiles`, `categories`, `products`, `product_images`, `product_variants`, `inventory`, `addresses`, `carts`, `cart_items`, `favorites`, `promo_codes`, `orders`, `order_items`), enum-типы, ограничения, индексы |
+| `20261108000002_rls_and_functions.sql` | роли и RLS, триггер профиля, защита роли, расчёт доставки и скидки, `place_order`, бакет и политики Storage |
+| `20261109000003_order_idempotency.sql` | ключ идемпотентности, блокировка заказов пользователя, новая `place_order` |
+| `20261110000004_admin_panel.sql` | журнал склада, `adjust_stock`, защита статусов заказа, возврат остатков и промокода при отмене, аналитика Dashboard |
+| `20261113000005_catalog_facets.sql` | `catalog_facets()`: фасеты каталога одним запросом |
+
+Права: каталог читают все, свои корзины/избранное/адреса/заказы — владельцы, заказы и склад меняет только админ; промокоды покупатель видит только через `quote_order`.
+
+## Тестирование
+
+```bash
+npm run verify        # typecheck + lint + unit + проверка setup.sql + тесты БД + поиск секретов + build + анализ сборки
+npm run typecheck     # TypeScript
+npm run lint          # ESLint
+npm run test:unit     # CSV, проверка окружения, поиск секретов
+npm run test:db       # 59 проверок RLS, склада, заказов + установка setup.sql на чистой базе (PGlite)
+npm run test:static   # после build: секреты в сборке, бюджет JS
+npm run scan:secrets  # секреты в файлах репозитория
+npm run e2e           # Playwright (нужен ТЕСТОВЫЙ проект Supabase, e2e/README.md)
+```
+
+Что проверено на момент релиза:
+
+| Проверка | Результат |
+|---|---|
+| TypeScript, ESLint, production build | проходят |
+| Тесты БД (PGlite): RLS, роли, `place_order`, идемпотентность, остатки, журнал, отмена, Storage-политики, `setup.sql` | проходят |
+| Unit: CSV, env-check, scan-secrets | проходят |
+| Анализ сборки: секреты, бюджет JS (258 КБ gzip всего) | проходит |
+| Playwright без бэкенда (заглушка, 404, заголовки, экспорт без входа) | 11 тестов проходят |
+| Playwright со Supabase (80 сценариев: auth, каталог, корзина, заказ, админка, адаптивность, производительность) | **написаны, на живом проекте не запускались** |
+
+## Развёртывание на Vercel
+
+1. Подготовьте проект Supabase (раздел выше) и выложите код в GitHub. Перед публикацией выполните `npm run scan:secrets` — репозиторий не должен содержать `.env*` (кроме `.env.example`) и ключей.
+2. Vercel → Add New → Project → импортируйте репозиторий. Framework — Next.js, сборка `npm run build`, настройки по умолчанию.
+3. Environment Variables (Production и Preview): `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `NEXT_PUBLIC_SITE_URL` (адрес продакшен-домена). **`SUPABASE_SERVICE_ROLE_KEY` не добавляйте.**
+4. После первого деплоя пропишите адрес сайта в Supabase → Authentication → URL Configuration (Site URL и Redirect URLs, см. выше).
+5. Проверьте: главная и каталог открываются с товарами, регистрация и вход работают, `/admin` под покупателем закрыт, фото из Unsplash и Storage отображаются.
+6. Регион функций Vercel выберите рядом с регионом Supabase, чтобы уменьшить задержки.
+
+GitHub Actions (`.github/workflows/ci.yml`) выполняет проверки без секретов. Для e2e-задачи задайте переменную репозитория `E2E_ENABLED=true` и секреты `E2E_SUPABASE_URL`, `E2E_SUPABASE_ANON_KEY`, `E2E_SUPABASE_SERVICE_ROLE_KEY` **тестового** проекта: тесты создают и удаляют данные.
+
+## Безопасность
+- Пароли хранит и хэширует Supabase Auth; приложение паролей не видит и не хранит.
+- Service role key отсутствует в приложении; сборка проверяется на его наличие (`test:static`), репозиторий — сканером (`scan:secrets`), окружение — `check:env`.
+- RLS включён на всех таблицах; тесты проверяют, что покупатель не читает и не меняет чужие заказы, корзины, профили, не меняет роль и цены.
+- Заголовки: `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy`, `Permissions-Policy`. Content-Security-Policy не настроен.
+- Серверные ошибки базы клиенту не показываются: выводятся только сообщения бизнес-правил.
+
+## Что реально, а что демо
+
+| | Статус |
+|---|---|
+| Регистрация, вход, сброс пароля (Supabase Auth) | реально |
+| Роли и доступ (RLS), каталог, корзина, заказы, промокоды, склад, админка, CSV, Storage | реально (логика в БД проверена тестами) |
+| **Оплата** | **не подключена.** Платёжного провайдера нет, деньги не списываются; заказ создаётся «Новый». В форме есть явная пометка |
+| **Доставка** | **не подключена.** Только расчёт стоимости по правилу (курьер 490 ₽, почта 290 ₽, самовывоз и заказы от 15 000 ₽ бесплатно). Служб доставки и трекинга нет |
+| Письма о заказах и статусах | не отправляются (письма Supabase Auth — отдельно) |
+| Демо-заказы (`seed:demo`) | вставлены напрямую, остатки не списывают |
+| Фото каталога | внешние ссылки Unsplash |
+| Раздел «Настройки» админки | только чтение |
+
+## Ограничения и планы
+- Не проверено на живом Supabase: запросы приложения, письма, Storage из интерфейса, e2e-набор.
+- Нет оплаты, интеграций доставки, уведомлений покупателям, возвратов, отзывов, мультивалютности и мультиязычности (интерфейс на русском, цены в рублях).
+- Списки админки без постраничной разбивки (до 500 записей); Dashboard агрегирует по всем заказам в приложении.
+- Нет Content-Security-Policy, ограничения частоты запросов (rate limit) на уровне приложения (есть лимиты Supabase Auth).
+- Возможные улучшения: платёжный провайдер (вебхуки + статусы), доставка (СДЭК/Почта), письма о заказах (Resend/SMTP), постраничность и поиск по полнотекстовому индексу, редактирование настроек магазина, отзывы, CSP, мониторинг ошибок (Sentry), типы БД через `supabase gen types`.
+
+Подробный сценарий показа: [docs/DEMO.md](docs/DEMO.md).
