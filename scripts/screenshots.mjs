@@ -66,7 +66,7 @@ await page.goto(`${base}/login?next=/admin`);
 await page.getByLabel("Email").fill("admin@shopflow.demo");
 await page.getByLabel("Пароль").fill(password);
 await page.getByRole("button", { name: "Войти" }).click();
-await page.waitForURL(/\/admin/);
+await page.waitForURL((u) => u.pathname === "/admin");
 await shot(page, "07-admin-dashboard", "/admin", { full: true });
 await shot(page, "08-admin-products", "/admin/products");
 await shot(page, "09-admin-orders", "/admin/orders");
