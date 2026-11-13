@@ -22,24 +22,21 @@ const check = (name, ok, detail = "") => {
 // Серверные файлы могут читать process.env, но значения ключей не должны быть вшиты ни туда, ни сюда.
 const clientFiles = walk(path.join(root, "static")).filter((f) => /\.(js|css|html|json|map)$/.test(f));
 const serverFiles = walk(path.join(root, "server")).filter((f) => /\.(js|html|rsc|json)$/.test(f));
-const secretValues = [process.env.SUPABASE_SERVICE_ROLE_KEY].filter(Boolean);
-const jwtRole = (token) => {
-  try { return JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString()).role; } catch { return null; }
-};
+const secretValues = [process.env.TURSO_AUTH_TOKEN, process.env.BLOB_READ_WRITE_TOKEN].filter(Boolean);
 const jwtRe = /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g;
 
 const leaks = [];
 for (const f of [...clientFiles, ...serverFiles]) {
   const text = fs.readFileSync(f, "utf8");
   const isClient = f.startsWith(path.join(root, "static"));
-  if (isClient && /SUPABASE_SERVICE_ROLE_KEY|service_role/.test(text)) leaks.push(`${path.relative(root, f)}: упоминание service role`);
+  if (isClient && /TURSO_AUTH_TOKEN|BLOB_READ_WRITE_TOKEN|password_hash/.test(text)) leaks.push(`${path.relative(root, f)}: упоминание серверного секрета`);
   for (const v of secretValues) if (text.includes(v)) leaks.push(`${path.relative(root, f)}: значение ключа`);
-  for (const t of text.match(jwtRe) ?? []) if (jwtRole(t) === "service_role") leaks.push(`${path.relative(root, f)}: JWT с ролью service_role`);
+  if (text.match(jwtRe)?.length) leaks.push(`${path.relative(root, f)}: JWT-токен`);
 }
-check("секреты: service role key нет в сборке", leaks.length === 0, leaks.slice(0, 5).join("; "));
+check("секреты: токенов базы и Blob нет в сборке", leaks.length === 0, leaks.slice(0, 5).join("; "));
 
 const envExample = fs.readFileSync(path.join(process.cwd(), ".env.example"), "utf8");
-check(".env.example не содержит значений секретов", /SUPABASE_SERVICE_ROLE_KEY=\s*$/m.test(envExample) && !jwtRe.test(envExample));
+check(".env.example не содержит значений секретов", /^TURSO_AUTH_TOKEN=\s*$/m.test(envExample) && /^BLOB_READ_WRITE_TOKEN=\s*$/m.test(envExample) && !jwtRe.test(envExample));
 const tracked = fs.readFileSync(path.join(process.cwd(), ".gitignore"), "utf8");
 check(".env.local исключён из git", /^\.env\*/m.test(tracked) && /!\.env\.example/.test(tracked));
 

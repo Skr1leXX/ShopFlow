@@ -1,54 +1,67 @@
 import "server-only";
-import { createClient } from "@/lib/supabase/server";
+import { db } from "@/lib/db";
+import { all, flag, one } from "@/lib/core/db";
+import { hydrateProducts, toCategory } from "./shape";
+import { hydrateOrders } from "./user";
 import type { Category, Order, Product, ProductFull, Profile, PromoCode } from "./types";
 
-// Только для админ-страниц (после requireAdmin). Доступ к данным ограничивает RLS, аналитику — проверка is_admin() в RPC.
+// Только для админ-страниц: каждая страница сначала вызывает requireAdmin(). Данные читаются из базы напрямую,
+// поэтому проверка роли на сервере здесь единственный барьер, и она выполняется до любого запроса.
 
 export const LOW_STOCK = 3;
 
-const clean = (s: string) => s.replace(/[,()%*\\]/g, " ").trim();
+const includes = (hay: (string | null | undefined)[], needle: string) => {
+  const n = needle.trim().toLowerCase();
+  return !n || hay.some((h) => (h ?? "").toLowerCase().includes(n)); // регистр кириллицы SQLite не понижает, поэтому поиск в JS
+};
 
 export type DashboardData = Awaited<ReturnType<typeof getDashboard>>;
 
 export async function getDashboard() {
-  const supabase = await createClient();
+  const since = new Date(Date.now() - 29 * 86_400_000).toISOString().slice(0, 10);
   const [orders, customers, products, lowStock, recent, sales, top] = await Promise.all([
-    supabase.from("orders").select("total,status"),
-    supabase.from("profiles").select("id", { count: "exact", head: true }).eq("role", "customer"),
-    supabase.from("products").select("id", { count: "exact", head: true }).eq("is_active", true),
-    supabase
-      .from("inventory")
-      .select("variant_id, quantity, variant:product_variants!inner(size,color,is_active,products!inner(name,is_active))")
-      .lte("quantity", LOW_STOCK)
-      .order("quantity")
-      .limit(8),
-    supabase.from("orders").select("id,number,status,total,contact_name,created_at").order("created_at", { ascending: false }).limit(6),
-    supabase.rpc("admin_sales_by_day", { p_days: 30 }),
-    supabase.rpc("admin_top_products", { p_limit: 5 }),
+    all<{ total: number; status: string }>(db(), "select total, status from orders"),
+    one<{ n: number }>(db(), "select count(*) n from profiles where role = 'customer'"),
+    one<{ n: number }>(db(), "select count(*) n from products where is_active = 1"),
+    all(
+      db(),
+      `select i.variant_id, i.quantity, pv.size, pv.color, pv.is_active v_active, p.name, p.is_active p_active
+       from inventory i join product_variants pv on pv.id = i.variant_id join products p on p.id = pv.product_id
+       where i.quantity <= ? order by i.quantity, p.name limit 8`,
+      [LOW_STOCK],
+    ),
+    all(db(), "select id, number, status, total, contact_name, created_at from orders order by created_at desc limit 6"),
+    all<{ day: string; orders: number; revenue: number }>(
+      db(),
+      "select substr(created_at, 1, 10) day, count(*) orders, sum(total) revenue from orders where status <> 'cancelled' and substr(created_at, 1, 10) >= ? group by day",
+      [since],
+    ),
+    all<{ product_id: string | null; name: string; units: number; revenue: number }>(
+      db(),
+      `select oi.product_id, max(oi.product_name) name, sum(oi.quantity) units, sum(oi.unit_price * oi.quantity) revenue
+       from order_items oi join orders o on o.id = oi.order_id and o.status <> 'cancelled'
+       group by oi.product_id order by units desc, revenue desc limit 5`,
+    ),
   ]);
-  const err = orders.error ?? customers.error ?? products.error ?? lowStock.error ?? recent.error ?? sales.error ?? top.error;
-  if (err) throw new Error(err.message);
 
-  const valid = (orders.data ?? []).filter((o) => o.status !== "cancelled");
+  const valid = orders.filter((o) => o.status !== "cancelled");
   const revenue = valid.reduce((s, o) => s + Number(o.total), 0);
+  const byDay = new Map(sales.map((r) => [r.day, r]));
+  const days = Array.from({ length: 30 }, (_, i) => new Date(Date.now() - (29 - i) * 86_400_000).toISOString().slice(0, 10));
   return {
-    orderCount: orders.data?.length ?? 0,
+    orderCount: orders.length,
     revenue,
     avgCheck: valid.length ? revenue / valid.length : 0,
-    newOrders: (orders.data ?? []).filter((o) => o.status === "pending").length,
-    customers: customers.count ?? 0,
-    products: products.count ?? 0,
-    lowStock: (lowStock.data ?? []) as unknown as {
-      variant_id: string; quantity: number;
-      variant: { size: string; color: string; is_active: boolean; products: { name: string; is_active: boolean } };
-    }[],
-    recent: (recent.data ?? []) as Pick<Order, "id" | "number" | "status" | "total" | "contact_name" | "created_at">[],
-    sales: ((sales.data ?? []) as { day: string; orders: number; revenue: number }[]).map((r) => ({
-      day: r.day, orders: Number(r.orders), revenue: Number(r.revenue),
+    newOrders: orders.filter((o) => o.status === "pending").length,
+    customers: customers?.n ?? 0,
+    products: products?.n ?? 0,
+    lowStock: lowStock.map((r) => ({
+      variant_id: r.variant_id as string, quantity: r.quantity as number,
+      variant: { size: r.size as string, color: r.color as string, is_active: flag(r.v_active), products: { name: r.name as string, is_active: flag(r.p_active) } },
     })),
-    top: ((top.data ?? []) as { product_id: string | null; name: string; units: number; revenue: number }[]).map((r) => ({
-      ...r, units: Number(r.units), revenue: Number(r.revenue),
-    })),
+    recent: recent as unknown as Pick<Order, "id" | "number" | "status" | "total" | "contact_name" | "created_at">[],
+    sales: days.map((day) => ({ day, orders: Number(byDay.get(day)?.orders ?? 0), revenue: Number(byDay.get(day)?.revenue ?? 0) })),
+    top: top.map((r) => ({ ...r, units: Number(r.units), revenue: Number(r.revenue) })),
   };
 }
 
@@ -57,26 +70,21 @@ export type ProductFilters = { q?: string; category?: string; status?: string; s
 export type AdminProduct = Product & { variant_count: number; total_stock: number };
 
 export async function listAdminProducts(f: ProductFilters = {}): Promise<AdminProduct[]> {
-  const supabase = await createClient();
-  let q = supabase
-    .from("products")
-    .select("*, product_images(id,url,storage_path,alt,sort_order), categories(name,slug), product_variants(id,inventory(quantity))")
-    .order("sort_order", { referencedTable: "product_images" })
-    .limit(500);
-  if (f.q && clean(f.q)) q = q.or(`name.ilike.%${clean(f.q)}%,brand.ilike.%${clean(f.q)}%,slug.ilike.%${clean(f.q)}%`);
-  if (f.category) q = q.eq("category_id", f.category);
-  if (f.status === "active") q = q.eq("is_active", true);
-  if (f.status === "hidden") q = q.eq("is_active", false);
-  const { data, error } = await q;
-  if (error) throw new Error(error.message);
+  const where = ["1 = 1"];
+  const args: string[] = [];
+  if (f.category) { where.push("category_id = ?"); args.push(f.category); }
+  if (f.status === "active") where.push("is_active = 1");
+  if (f.status === "hidden") where.push("is_active = 0");
+  const rows = (await all(db(), `select * from products where ${where.join(" and ")} order by created_at desc limit 500`, args))
+    .filter((r) => includes([r.name as string, r.brand as string, r.slug as string], f.q ?? ""));
 
-  let rows = (data as unknown as (Product & { product_variants: { id: string; inventory: { quantity: number } | null }[] })[]).map((p) => ({
+  let list = (await hydrateProducts(rows, true)).map((p) => ({
     ...p,
     variant_count: p.product_variants.length,
     total_stock: p.product_variants.reduce((s, v) => s + (v.inventory?.quantity ?? 0), 0),
   }));
-  if (f.stock === "out") rows = rows.filter((p) => p.total_stock === 0);
-  if (f.stock === "in") rows = rows.filter((p) => p.total_stock > 0);
+  if (f.stock === "out") list = list.filter((p) => p.total_stock === 0);
+  if (f.stock === "in") list = list.filter((p) => p.total_stock > 0);
   const sorts: Record<string, (a: AdminProduct, b: AdminProduct) => number> = {
     name: (a, b) => a.name.localeCompare(b.name, "ru"),
     price_asc: (a, b) => a.price - b.price,
@@ -84,48 +92,29 @@ export async function listAdminProducts(f: ProductFilters = {}): Promise<AdminPr
     stock: (a, b) => a.total_stock - b.total_stock,
     created: (a, b) => b.created_at.localeCompare(a.created_at),
   };
-  return rows.sort(sorts[f.sort ?? "created"] ?? sorts.created);
+  return list.sort(sorts[f.sort ?? "created"] ?? sorts.created);
 }
 
 export async function getAdminProduct(id: string): Promise<ProductFull | null> {
-  const supabase = await createClient();
-  const { data, error } = await supabase
-    .from("products")
-    .select("*, product_images(id,url,storage_path,alt,sort_order), categories(name,slug), product_variants(id,sku,size,color,color_hex,is_active,inventory(quantity))")
-    .eq("id", id)
-    .order("sort_order", { referencedTable: "product_images" })
-    .maybeSingle();
-  if (error) throw new Error(error.message);
-  return data as unknown as ProductFull | null;
+  const row = await one(db(), "select * from products where id = ?", [id]);
+  return row ? (await hydrateProducts([row], true))[0] : null;
 }
 
 export async function listAdminCategories(): Promise<(Category & { product_count: number })[]> {
-  const supabase = await createClient();
-  const [cats, prods] = await Promise.all([
-    supabase.from("categories").select("*").order("sort_order").order("name"),
-    supabase.from("products").select("category_id"),
+  const [cats, counts] = await Promise.all([
+    all(db(), "select * from categories order by sort_order, name"),
+    all<{ category_id: string; n: number }>(db(), "select category_id, count(*) n from products group by category_id"),
   ]);
-  const err = cats.error ?? prods.error;
-  if (err) throw new Error(err.message);
-  return (cats.data as Category[]).map((c) => ({
-    ...c,
-    product_count: (prods.data ?? []).filter((p) => p.category_id === c.id).length,
-  }));
+  const byId = new Map(counts.map((c) => [c.category_id, c.n]));
+  return cats.map((c) => ({ ...toCategory(c), product_count: byId.get(c.id as string) ?? 0 }));
 }
 
 // ───────── заказы ─────────
 export async function listAdminOrders(f: { q?: string; status?: string } = {}): Promise<Order[]> {
-  const supabase = await createClient();
-  let q = supabase.from("orders").select("*, order_items(*)").order("created_at", { ascending: false }).limit(500);
-  if (f.status && f.status !== "all") q = q.eq("status", f.status);
-  const term = f.q ? clean(f.q) : "";
-  if (term) {
-    const like = `contact_name.ilike.%${term}%,contact_email.ilike.%${term}%,contact_phone.ilike.%${term}%`;
-    q = /^\d{1,12}$/.test(term) ? q.or(`number.eq.${term},${like}`) : q.or(like);
-  }
-  const { data, error } = await q;
-  if (error) throw new Error(error.message);
-  return data as unknown as Order[];
+  const status = f.status && f.status !== "all" ? f.status : null;
+  const rows = (await all(db(), `select * from orders ${status ? "where status = ?" : ""} order by created_at desc limit 500`, status ? [status] : []))
+    .filter((o) => includes([String(o.number), o.contact_name as string, o.contact_email as string, o.contact_phone as string], f.q ?? ""));
+  return hydrateOrders(rows);
 }
 
 // ───────── клиенты ─────────
@@ -135,43 +124,43 @@ export type CustomerRow = Profile & {
 };
 
 export async function listCustomers(search?: string): Promise<CustomerRow[]> {
-  const supabase = await createClient();
-  let pq = supabase.from("profiles").select("*").order("created_at", { ascending: false }).limit(500);
-  const term = search ? clean(search) : "";
-  if (term) pq = pq.or(`full_name.ilike.%${term}%,email.ilike.%${term}%,phone.ilike.%${term}%`);
-  const [profiles, orders] = await Promise.all([pq, supabase.from("orders").select("id,number,status,total,created_at,user_id").order("created_at", { ascending: false })]);
-  const err = profiles.error ?? orders.error;
-  if (err) throw new Error(err.message);
-  return (profiles.data as Profile[]).map((p) => {
-    const mine = (orders.data ?? []).filter((o) => o.user_id === p.id);
-    return {
-      ...p,
-      orders: mine.length,
-      spent: mine.filter((o) => o.status !== "cancelled").reduce((s, o) => s + Number(o.total), 0),
-      history: mine,
-    };
-  });
+  const [profiles, orders] = await Promise.all([
+    all<Profile>(db(), "select id, email, full_name, phone, role, created_at from profiles order by created_at desc limit 500"),
+    all<Pick<Order, "id" | "number" | "status" | "total" | "created_at"> & { user_id: string }>(
+      db(), "select id, number, status, total, created_at, user_id from orders order by created_at desc",
+    ),
+  ]);
+  return profiles
+    .filter((p) => includes([p.full_name, p.email, p.phone], search ?? ""))
+    .map((p) => {
+      const mine = orders.filter((o) => o.user_id === p.id);
+      return {
+        ...p,
+        orders: mine.length,
+        spent: mine.filter((o) => o.status !== "cancelled").reduce((s, o) => s + Number(o.total), 0),
+        history: mine,
+      };
+    });
 }
 
 // ───────── склад ─────────
 export type StockRow = { variant_id: string; quantity: number; variant: { sku: string; size: string; color: string; products: { name: string; slug: string } } };
 
 export async function listStock(f: { q?: string; filter?: string } = {}): Promise<StockRow[]> {
-  const supabase = await createClient();
-  let q = supabase
-    .from("inventory")
-    .select("variant_id, quantity, variant:product_variants!inner(sku,size,color,products!inner(name,slug))")
-    .order("quantity")
-    .limit(1000);
-  if (f.filter === "out") q = q.eq("quantity", 0);
-  if (f.filter === "low") q = q.gt("quantity", 0).lte("quantity", LOW_STOCK);
-  if (f.filter === "in") q = q.gt("quantity", 0);
-  const term = f.q ? clean(f.q) : "";
-  const { data, error } = await q;
-  if (error) throw new Error(error.message);
-  const rows = data as unknown as StockRow[];
-  // Поиск по названию товара — после выборки: PostgREST не умеет OR по двум уровням вложенности.
-  return term ? rows.filter((r) => r.variant.products.name.toLowerCase().includes(term.toLowerCase()) || r.variant.sku.toLowerCase().includes(term.toLowerCase()) || r.variant.size.toLowerCase() === term.toLowerCase()) : rows;
+  const cond = f.filter === "out" ? "where i.quantity = 0" : f.filter === "low" ? `where i.quantity > 0 and i.quantity <= ${LOW_STOCK}` : f.filter === "in" ? "where i.quantity > 0" : "";
+  const rows = await all(
+    db(),
+    `select i.variant_id, i.quantity, pv.sku, pv.size, pv.color, p.name, p.slug
+     from inventory i join product_variants pv on pv.id = i.variant_id join products p on p.id = pv.product_id
+     ${cond} order by i.quantity, p.name limit 1000`,
+  );
+  const term = (f.q ?? "").trim().toLowerCase();
+  return rows
+    .map((r) => ({
+      variant_id: r.variant_id as string, quantity: r.quantity as number,
+      variant: { sku: r.sku as string, size: r.size as string, color: r.color as string, products: { name: r.name as string, slug: r.slug as string } },
+    }))
+    .filter((r) => !term || r.variant.products.name.toLowerCase().includes(term) || r.variant.sku.toLowerCase().includes(term) || r.variant.size.toLowerCase() === term);
 }
 
 export type MovementRow = {
@@ -180,19 +169,20 @@ export type MovementRow = {
 };
 
 export async function listMovements(limit = 60): Promise<MovementRow[]> {
-  const supabase = await createClient();
-  const { data, error } = await supabase
-    .from("inventory_movements")
-    .select("id,delta,balance,reason,note,created_at,order_id, variant:product_variants(size,color,products(name))")
-    .order("created_at", { ascending: false })
-    .limit(limit);
-  if (error) throw new Error(error.message);
-  return data as unknown as MovementRow[];
+  const rows = await all(
+    db(),
+    `select m.id, m.delta, m.balance, m.reason, m.note, m.created_at, m.order_id, pv.size, pv.color, p.name
+     from inventory_movements m join product_variants pv on pv.id = m.variant_id join products p on p.id = pv.product_id
+     order by m.created_at desc, m.rowid desc limit ?`,
+    [limit],
+  );
+  return rows.map((r) => ({
+    id: r.id as string, delta: r.delta as number, balance: r.balance as number, reason: r.reason as string, note: r.note as string,
+    created_at: r.created_at as string, order_id: (r.order_id as string | null) ?? null,
+    variant: { size: r.size as string, color: r.color as string, products: { name: r.name as string } },
+  }));
 }
 
 export async function listPromos(): Promise<PromoCode[]> {
-  const supabase = await createClient();
-  const { data, error } = await supabase.from("promo_codes").select("*").order("created_at", { ascending: false });
-  if (error) throw new Error(error.message);
-  return data as PromoCode[];
+  return (await all(db(), "select * from promo_codes order by created_at desc, code")).map((r) => ({ ...(r as unknown as PromoCode), is_active: flag(r.is_active) }));
 }

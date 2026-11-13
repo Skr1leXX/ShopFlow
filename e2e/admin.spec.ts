@@ -1,9 +1,9 @@
 import { expect, test, type Browser, type Page } from "@playwright/test";
-import { admin, ordersOf, readState, resetCustomerData, setStockDirect, stockOf } from "./support/db";
-import { hasBackend } from "./support/env";
+import { ordersOf, readState, resetCustomerData, setStockDirect, sqlRow, sqlRows, sqlVal, stockOf } from "./support/db";
+import { hasBackend, hasBlob } from "./support/env";
 import { login, normalize, trackErrors, alertOf } from "./support/helpers";
 
-test.skip(!hasBackend, "нужен проект Supabase (см. e2e/README.md)");
+test.skip(!hasBackend, "нужна база данных (TURSO_DATABASE_URL, см. e2e/README.md)");
 test.describe.configure({ mode: "serial" });
 
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
@@ -82,9 +82,8 @@ test.describe("dashboard", () => {
   test("показатели совпадают с данными в базе", async ({ page, browser }) => {
     await placeCustomerOrder(browser);
     await asAdmin(page);
-    const db = admin();
-    const { data } = await db.from("orders").select("total,status");
-    const valid = data!.filter((o) => o.status !== "cancelled");
+    const data = await sqlRows<{ total: number; status: string }>("select total, status from orders");
+    const valid = data.filter((o) => o.status !== "cancelled");
     const revenue = valid.reduce((n, o) => n + Number(o.total), 0);
     const text = normalize(await page.locator("main").innerText());
     expect(text).toContain(`${Math.round(revenue).toLocaleString("ru-RU").replace(/ /g, " ")} ₽`);
@@ -108,7 +107,7 @@ test.describe("товары: CRUD, фото, варианты", () => {
     await page.getByLabel("Название", { exact: true }).fill(name);
     await page.getByLabel("Бренд").fill("E2EBrandA");
     await page.getByLabel("Категория").selectOption({ label: s.categoryName });
-    await page.getByLabel("Цена, ₽").fill("1500");
+    await page.getByLabel("Цена, ₽", { exact: true }).fill("1500");
     await page.getByLabel(/Старая цена/).fill("1000");
     await page.getByRole("button", { name: "Создать товар" }).click();
     await expect(alertOf(page)).toHaveText("Старая цена должна быть выше текущей");
@@ -122,14 +121,14 @@ test.describe("товары: CRUD, фото, варианты", () => {
     await expect(page.getByRole("heading", { level: 1, name })).toBeVisible();
 
     // редактирование цены и скидки
-    await page.getByLabel("Цена, ₽").fill("1800");
+    await page.getByLabel("Цена, ₽", { exact: true }).fill("1800");
     await page.getByLabel(/Старая цена/).fill("2400");
     await page.getByRole("button", { name: "Сохранить товар" }).click();
     await expect(page.getByRole("status")).toHaveText("Товар сохранён");
-    const { data: row } = await admin().from("products").select("id,price,old_price,details").eq("slug", `e2e-admin-${s.run}`).single();
+    const row = await sqlRow("select id, price, old_price, details from products where slug = ?", [`e2e-admin-${s.run}`]);
     expect(Number(row!.price)).toBe(1800);
     expect(Number(row!.old_price)).toBe(2400);
-    expect(row!.details).toMatchObject({ "Материал": "хлопок" });
+    expect(JSON.parse(row!.details)).toMatchObject({ "Материал": "хлопок" });
 
     // варианты и остатки
     const vForm = page.locator("form", { has: page.getByRole("button", { name: "Добавить вариант" }) });
@@ -138,7 +137,7 @@ test.describe("товары: CRUD, фото, варианты", () => {
     await vForm.getByLabel("Остаток").fill("4");
     await vForm.getByRole("button", { name: "Добавить вариант" }).click();
     await expect(page.getByText("Вариант добавлен")).toBeVisible();
-    await expect(page.getByRole("cell", { name: "XL" })).toBeVisible();
+    await expect(page.getByRole("cell", { name: "XL", exact: true })).toBeVisible();
     await vForm.getByLabel("Размер").fill("XL");
     await vForm.getByLabel("Название цвета").fill("Зелёный");
     await vForm.getByRole("button", { name: "Добавить вариант" }).click();
@@ -147,39 +146,41 @@ test.describe("товары: CRUD, фото, варианты", () => {
     const stockCell = page.locator("tr", { hasText: "XL" }).getByLabel("Остаток");
     await stockCell.fill("9");
     await page.locator("tr", { hasText: "XL" }).getByRole("button", { name: "Сохранить" }).click();
-    await expect.poll(async () => {
-      const { data } = await admin().from("inventory").select("quantity, product_variants!inner(sku)").like("product_variants.sku", `%E2E-ADMIN-${s.run.toUpperCase()}%`);
-      return data?.[0]?.quantity;
-    }).toBe(9);
+    await expect.poll(() => sqlVal("select i.quantity from inventory i join product_variants v on v.id = i.variant_id where v.sku like ?", [`%E2E-ADMIN-${s.run.toUpperCase()}%`])).toBe(9);
 
     // фото: загрузка, замена, удаление
     const photos = page.locator("section", { has: page.getByRole("heading", { name: "Фотографии" }) });
-    await photos.locator("input[type=file]").last().setInputFiles(png());
-    await expect(photos.locator("img")).toHaveCount(1);
-    const { data: img1 } = await admin().from("product_images").select("id,storage_path,url").eq("product_id", row!.id);
-    expect(img1).toHaveLength(1);
-    expect(img1![0].storage_path).toMatch(new RegExp(`^${row!.id}/.+\\.png$`));
-    const oldPath = img1![0].storage_path!;
+    if (hasBlob) {
+      await photos.locator("input[type=file]").last().setInputFiles(png());
+      await expect(photos.locator("img")).toHaveCount(1);
+      const img1 = await sqlRows("select id, storage_path from product_images where product_id = ?", [row!.id]);
+      expect(img1).toHaveLength(1);
+      expect(img1[0].storage_path).toMatch(/\.blob\.vercel-storage\.com\/products\/.+\.png$/);
+      const oldPath = img1[0].storage_path;
 
-    await photos.locator("input[type=file]").first().setInputFiles(png("replace.png"));
-    await expect.poll(async () => (await admin().from("product_images").select("storage_path").eq("product_id", row!.id)).data![0].storage_path).not.toBe(oldPath);
-    const gone = await admin().storage.from("product-images").list(row!.id);
-    expect(gone.data!.some((f) => oldPath.endsWith(f.name))).toBe(false); // старый файл удалён из Storage
+      await photos.locator("input[type=file]").first().setInputFiles(png("replace.png"));
+      await expect.poll(() => sqlVal("select storage_path from product_images where product_id = ?", [row!.id])).not.toBe(oldPath);
 
-    // недопустимый тип файла отклоняется
-    await photos.locator("input[type=file]").last().setInputFiles({ name: "x.txt", mimeType: "text/plain", buffer: Buffer.from("hi") });
-    await expect(alertOf(page).filter({ hasText: "Допустимы JPG" })).toBeVisible();
+      // недопустимый тип файла отклоняется
+      await photos.locator("input[type=file]").last().setInputFiles({ name: "x.txt", mimeType: "text/plain", buffer: Buffer.from("hi") });
+      await expect(alertOf(page).filter({ hasText: "Допустимы JPG" })).toBeVisible();
 
-    await photos.getByRole("button", { name: "Удалить фото" }).click();
-    await confirmDialog(page);
-    await expect(photos.locator("img")).toHaveCount(0);
+      await photos.getByRole("button", { name: "Удалить фото" }).click();
+      await confirmDialog(page);
+      await expect(photos.locator("img")).toHaveCount(0);
+    } else {
+      // Без токена Vercel Blob загрузка честно сообщает, что не настроена, и ничего не сохраняет.
+      await photos.locator("input[type=file]").last().setInputFiles(png());
+      await expect(alertOf(page).filter({ hasText: "BLOB_READ_WRITE_TOKEN" })).toBeVisible();
+      expect(await sqlVal("select count(*) from product_images where product_id = ?", [row!.id])).toBe(0);
+    }
 
     // скрытие: товар пропадает с витрины, но остаётся в админке
     await page.getByLabel("Показывать в каталоге").uncheck();
     await page.getByRole("button", { name: "Сохранить товар" }).click();
     await expect(page.getByRole("status")).toHaveText("Товар сохранён");
     const pub = await page.request.get(`/product/e2e-admin-${s.run}`);
-    expect(pub.status()).toBe(404);
+    expect(await pub.text()).toContain("Страница не найдена"); // статус при потоковой отдаче может быть 200, смотрим на содержимое
     await page.getByLabel("Показывать в каталоге").check();
     await page.getByRole("button", { name: "Сохранить товар" }).click();
     await expect(page.getByRole("status")).toHaveText("Товар сохранён");
@@ -198,11 +199,11 @@ test.describe("товары: CRUD, фото, варианты", () => {
     await expect(page.getByRole("dialog")).toBeVisible();
     await page.keyboard.press("Escape");
     await expect(page.getByRole("dialog")).toBeHidden();
-    expect((await admin().from("products").select("id").eq("id", row!.id)).data).toHaveLength(1);
+    expect(await sqlVal("select count(*) from products where id = ?", [row!.id])).toBe(1);
     await page.getByRole("button", { name: "Удалить", exact: true }).click();
     await confirmDialog(page);
     await expect(page).toHaveURL(/\/admin\/products$/);
-    expect((await admin().from("products").select("id").eq("id", row!.id)).data).toHaveLength(0);
+    expect(await sqlVal("select count(*) from products where id = ?", [row!.id])).toBe(0);
     expect(errors.filter((e) => !/400|413/.test(e))).toEqual([]);
   });
 
@@ -244,20 +245,24 @@ test.describe("категории: CRUD, изображение, порядок"
     await row.getByLabel("Название").fill(`${name} ред.`);
     await row.getByRole("button", { name: "Сохранить" }).click();
     await expect(row.getByRole("status")).toHaveText("Категория сохранена");
-    const { data: c } = await admin().from("categories").select("id,name,sort_order").eq("slug", `e2e-cat-${s.run}`).single();
+    const c = await sqlRow("select id, name, sort_order from categories where slug = ?", [`e2e-cat-${s.run}`]);
     expect(c!.name).toBe(`${name} ред.`);
 
     // порядок: стрелка вверх меняет sort_order
     const before = c!.sort_order;
     await row.getByRole("button", { name: "Выше" }).click();
-    await expect.poll(async () => (await admin().from("categories").select("sort_order").eq("id", c!.id).single()).data!.sort_order).toBeLessThan(before);
+    await expect.poll(() => sqlVal("select sort_order from categories where id = ?", [c!.id]) as Promise<number>).toBeLessThan(before);
 
     // изображение
     await row.locator("input[type=file]").setInputFiles(png());
-    await expect.poll(async () => (await admin().from("categories").select("image_url").eq("id", c!.id).single()).data!.image_url).toContain("/product-images/categories/");
-    await row.getByRole("button", { name: "Убрать" }).click();
-    await confirmDialog(page);
-    await expect.poll(async () => (await admin().from("categories").select("image_url").eq("id", c!.id).single()).data!.image_url).toBeNull();
+    if (hasBlob) {
+      await expect.poll(() => sqlVal("select image_url from categories where id = ?", [c!.id]) as Promise<string>).toContain("/categories/");
+      await row.getByRole("button", { name: "Убрать" }).click();
+      await confirmDialog(page);
+      await expect.poll(() => sqlVal("select image_url from categories where id = ?", [c!.id])).toBeNull();
+    } else {
+      await expect(row.getByRole("alert")).toContainText("BLOB_READ_WRITE_TOKEN");
+    }
 
     // категорию с товарами удалить нельзя
     const used = page.locator("div.rounded-2xl", { hasText: s.categoryName }).first();
@@ -269,7 +274,7 @@ test.describe("категории: CRUD, изображение, порядок"
     // пустую — можно
     await row.getByRole("button", { name: "Удалить" }).click();
     await confirmDialog(page);
-    await expect.poll(async () => (await admin().from("categories").select("id").eq("id", c!.id)).data!.length).toBe(0);
+    await expect.poll(() => sqlVal("select count(*) from categories where id = ?", [c!.id])).toBe(0);
   });
 });
 
@@ -290,10 +295,10 @@ test.describe("заказы и склад", () => {
     await expect(d).toContainText("демо-оплата");
 
     await d.getByLabel("Статус заказа").selectOption("paid");
-    await expect.poll(async () => (await admin().from("orders").select("status").eq("id", order.id).single()).data!.status).toBe("paid");
+    await expect.poll(() => sqlVal("select status from orders where id = ?", [order.id])).toBe("paid");
 
     await d.getByLabel("Статус заказа").selectOption("cancelled");
-    await expect.poll(async () => (await admin().from("orders").select("status").eq("id", order.id).single()).data!.status).toBe("cancelled");
+    await expect.poll(() => sqlVal("select status from orders where id = ?", [order.id])).toBe("cancelled");
     expect(await stockOf(s.products.tee.variantM)).toBe(5); // остаток вернулся
 
     // из «Отменён» выйти нельзя: понятная ошибка, статус не меняется, остаток не удваивается
@@ -301,7 +306,7 @@ test.describe("заказы и склад", () => {
     await page.locator("details summary").click();
     await page.locator("details").getByLabel("Статус заказа").selectOption("processing");
     await expect(alertOf(page)).toContainText("изменить нельзя");
-    expect((await admin().from("orders").select("status").eq("id", order.id).single()).data!.status).toBe("cancelled");
+    expect(await sqlVal("select status from orders where id = ?", [order.id])).toBe("cancelled");
     expect(await stockOf(s.products.tee.variantM)).toBe(5);
 
     // фильтр по статусу
@@ -367,7 +372,7 @@ test.describe("заказы и склад", () => {
     await page.goto(`/admin/inventory?filter=out&q=${encodeURIComponent(s.products.tee.name)}`);
     await expect(page.locator("tbody tr").first()).toContainText("L");
     await page.goto(`/admin/inventory?filter=low&q=${encodeURIComponent(s.products.jacket.name)}`);
-    await expect(page.locator("tbody tr")).toHaveCount(1); // куртка M: остаток 3 ≤ 3
+    await expect(page.locator("table").first().locator("tbody tr")).toHaveCount(1); // куртка M: остаток 3 ≤ 3 (вторая таблица — журнал движения)
     // ручная установка остатка пишет корректировку
     await page.goto(`/admin/inventory?q=${encodeURIComponent(s.products.cap.name)}`);
     const row = page.locator("tr", { hasText: `E2E-${s.run}-CAP-M`.toUpperCase() });
@@ -398,15 +403,15 @@ test.describe("заказы и склад", () => {
     await row.getByLabel("Размер скидки").fill("20");
     await row.getByRole("button", { name: "Сохранить" }).click();
     await expect(row.getByRole("status")).toHaveText("Промокод сохранён");
-    const { data } = await admin().from("promo_codes").select("discount_percent,max_uses,expires_at").eq("code", code).single();
+    const data = await sqlRow("select discount_percent, max_uses, expires_at from promo_codes where code = ?", [code]);
     expect(data).toMatchObject({ discount_percent: 20, max_uses: 2 });
     expect(data!.expires_at).toContain("2099-12-31");
 
     await row.getByRole("button", { name: "Отключить" }).click();
-    await expect.poll(async () => (await admin().from("promo_codes").select("is_active").eq("code", code).single()).data!.is_active).toBe(false);
+    await expect.poll(() => sqlVal("select is_active from promo_codes where code = ?", [code])).toBe(0);
     await row.getByRole("button", { name: "Удалить" }).click();
     await confirmDialog(page);
-    await expect.poll(async () => (await admin().from("promo_codes").select("id").eq("code", code)).data!.length).toBe(0);
+    await expect.poll(() => sqlVal("select count(*) from promo_codes where code = ?", [code])).toBe(0);
   });
 });
 

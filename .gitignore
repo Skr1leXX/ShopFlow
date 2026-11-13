@@ -46,3 +46,5 @@ next-env.d.ts
 e2e-results
 e2e-report
 e2e/.state.json
+# local SQLite database
+local.db*

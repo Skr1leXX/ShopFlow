@@ -3,6 +3,7 @@ import { PageHeader } from "@/components/common/states";
 import { ActionForm } from "@/components/common/form";
 import { requireUser } from "@/lib/auth";
 import { updateProfile } from "@/lib/actions/shop";
+import { changePassword } from "@/lib/actions/auth";
 import { formatDate } from "@/lib/format";
 
 export const metadata: Metadata = { title: "Профиль" };
@@ -27,6 +28,13 @@ export default async function ProfilePage({ searchParams }: { searchParams: Prom
           <span className="text-muted-foreground">Телефон</span>
           <input name="phone" type="tel" defaultValue={profile.phone ?? ""} className={field} />
         </label>
+      </ActionForm>
+
+      <h2 className="mb-4 mt-12 text-2xl font-semibold">Смена пароля</h2>
+      <ActionForm action={changePassword} submit="Изменить пароль" className="max-w-lg" resetOnSuccess>
+        <input name="current" type="password" required autoComplete="current-password" aria-label="Текущий пароль" placeholder="Текущий пароль" className={field} />
+        <input name="password" type="password" required minLength={8} autoComplete="new-password" aria-label="Новый пароль" placeholder="Новый пароль (от 8 символов)" className={field} />
+        <input name="confirm" type="password" required autoComplete="new-password" aria-label="Повторите новый пароль" placeholder="Повторите новый пароль" className={field} />
       </ActionForm>
     </>
   );

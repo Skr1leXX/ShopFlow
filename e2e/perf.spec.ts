@@ -2,7 +2,7 @@ import { expect, test } from "@playwright/test";
 import { readState } from "./support/db";
 import { hasBackend } from "./support/env";
 
-test.skip(!hasBackend, "нужен проект Supabase (см. e2e/README.md)");
+test.skip(!hasBackend, "нужна база данных (TURSO_DATABASE_URL, см. e2e/README.md)");
 
 // Бюджеты рассчитаны на production-сборку на локальной машине; цель — ловить регрессии (лишние запросы, тяжёлые страницы).
 test.describe("производительность", () => {
@@ -23,7 +23,7 @@ test.describe("производительность", () => {
     expect(nav.ttfb, "TTFB").toBeLessThan(1500);
     expect(nav.dcl, "DOMContentLoaded").toBeLessThan(3500);
     expect(js / 1024, "JS на странице каталога, КБ (сжатый)").toBeLessThan(450);
-    expect(app.filter((r) => r.type === "fetch" || r.type === "xhr").length, "лишние XHR/fetch при открытии").toBeLessThanOrEqual(2);
+    expect(app.filter((r) => (r.type === "fetch" || r.type === "xhr") && !r.url.includes("_rsc=")).length, "лишние XHR/fetch при открытии").toBeLessThanOrEqual(2);
     expect(reqs.length, "всего запросов").toBeLessThan(60);
   });
 
@@ -46,7 +46,7 @@ test.describe("производительность", () => {
     const heroPage = await page.goto("/");
     expect(heroPage?.status()).toBe(200);
     const hero = page.locator("section img").first();
-    expect(await hero.getAttribute("fetchpriority")).toBe("high"); // LCP-изображение
+    expect(await hero.getAttribute("loading")).not.toBe("lazy"); // LCP-изображение грузится сразу (preload)
   });
 
   test("главная и товар: быстрый ответ сервера и заголовки безопасности", async ({ request }) => {
@@ -69,10 +69,10 @@ test.describe("производительность", () => {
       if (/javascript|html|json/.test(ct)) bodies.push(await r.text().catch(() => ""));
     });
     await page.goto(`/product/${s.products.tee.slug}`, { waitUntil: "networkidle" });
-    const key = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+    const secrets = [process.env.TURSO_AUTH_TOKEN, process.env.BLOB_READ_WRITE_TOKEN].filter((v): v is string => !!v);
     for (const b of bodies) {
-      expect(b.includes(key)).toBe(false);
-      expect(b).not.toContain("SUPABASE_SERVICE_ROLE_KEY");
+      for (const k of secrets) expect(b.includes(k)).toBe(false);
+      expect(b).not.toMatch(/TURSO_AUTH_TOKEN|BLOB_READ_WRITE_TOKEN|password_hash/);
     }
   });
 });

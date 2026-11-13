@@ -22,10 +22,10 @@ export function EmptyState({
 export function SetupNotice() {
   return (
     <div className="mx-auto my-24 max-w-xl rounded-3xl border bg-muted/50 p-8 text-center">
-      <h2 className="text-3xl font-semibold">Подключите Supabase</h2>
+      <h2 className="text-3xl font-semibold">Подключите базу данных</h2>
       <p className="mt-3 text-sm text-muted-foreground">
-        Переменные окружения не заданы. Скопируйте <code>.env.example</code> в <code>.env.local</code>, укажите URL и anon key
-        проекта, примените миграции из <code>supabase/migrations</code> и перезапустите сервер.
+        Переменные окружения не заданы. Скопируйте <code>.env.example</code> в <code>.env.local</code>, укажите адрес базы Turso
+        (<code>TURSO_DATABASE_URL</code>), выполните <code>npm run db:setup</code> и перезапустите сервер.
       </p>
     </div>
   );

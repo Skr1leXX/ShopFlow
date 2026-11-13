@@ -3,7 +3,7 @@ import { readState } from "./support/db";
 import { hasBackend } from "./support/env";
 import { addToCartOnProduct, login, trackErrors } from "./support/helpers";
 
-test.skip(!hasBackend, "нужен проект Supabase (см. e2e/README.md)");
+test.skip(!hasBackend, "нужна база данных (TURSO_DATABASE_URL, см. e2e/README.md)");
 
 // Запускается в проектах desktop (1440), tablet (iPad) и mobile (Pixel 7).
 const noOverflow = async (page: Page, where: string) => {
@@ -16,7 +16,7 @@ test.describe("адаптивность", () => {
     const s = readState();
     const errors = trackErrors(page);
     await addToCartOnProduct(page, s.products.tee.slug);
-    for (const path of ["/", `/catalog?category=e2e-${s.run}`, `/product/${s.products.tee.slug}`, "/cart", "/login", "/register", "/forgot-password", "/no-such-page"]) {
+    for (const path of ["/", `/catalog?category=e2e-${s.run}`, `/product/${s.products.tee.slug}`, "/cart", "/login", "/register", "/no-such-page"]) {
       await page.goto(path);
       await page.waitForLoadState("networkidle");
       await noOverflow(page, path);
@@ -34,20 +34,24 @@ test.describe("адаптивность", () => {
     await page.goto("/");
     const mobile = info.project.name !== "desktop" && (page.viewportSize()?.width ?? 0) < 1024;
     if (mobile) {
-      await page.getByText("Меню").first().click();
+      await page.locator("summary[aria-label='Меню']").click();
       await page.getByRole("navigation").getByRole("link", { name: s.categoryName }).first().click().catch(async () => {
         await page.getByRole("link", { name: "Весь каталог" }).click();
       });
       await expect(page).toHaveURL(/\/catalog/);
-      await page.getByRole("link", { name: "Поиск" }).click();
-      await expect(page.getByRole("searchbox").first()).toBeFocused();
+      if ((page.viewportSize()?.width ?? 0) >= 768) {
+        await expect(page.getByRole("searchbox").first()).toBeVisible(); // на планшете поле поиска видно в шапке
+      } else {
+        await page.getByRole("link", { name: "Поиск" }).click();
+        await expect(page.getByRole("searchbox").first()).toBeFocused();
+      }
     } else {
       await page.getByRole("navigation", { name: "Категории" }).getByRole("link", { name: "Каталог" }).click();
       await expect(page).toHaveURL(/\/catalog/);
     }
-    await expect(page.getByRole("link", { name: /^Корзина/ })).toBeVisible();
-    await expect(page.getByRole("link", { name: "Избранное" })).toBeVisible();
-    await expect(page.getByRole("link", { name: "ShopFlow — на главную" })).toBeVisible();
+    await expect(page.getByRole("link", { name: /^Корзина/ }).first()).toBeVisible();
+    await expect(page.getByRole("link", { name: "Избранное" }).first()).toBeVisible();
+    await expect(page.getByRole("link", { name: "ShopFlow — на главную" }).first()).toBeVisible();
   });
 
   test("элементы управления достаточно крупные для касания, поля не вызывают зум", async ({ page }, info) => {
@@ -75,7 +79,8 @@ test.describe("адаптивность", () => {
       await expect(details).toBeVisible();
       await expect(page.getByRole("complementary", { name: "Фильтры" })).toBeHidden();
       await details.locator("summary").click();
-      await details.getByLabel("E2EBrandB").check();
+      await details.getByLabel("E2EBrandB").click();
+      await expect(details.getByLabel("E2EBrandB")).toBeChecked();
       await expect(page).toHaveURL(/brand=E2EBrandB/);
       await expect(page.locator("article")).toHaveCount(1);
     } else {
@@ -102,7 +107,9 @@ test.describe("адаптивность", () => {
       expect(box!.height).toBeGreaterThanOrEqual(32);
     }
     await expect(page.getByRole("link", { name: "Войти и оформить заказ" })).toBeInViewport({ ratio: 0.1 }).catch(() => undefined);
-    await login(page, s.customer.email, "/checkout");
+    // Гостевая корзина переносится в базу уже после входа, поэтому возвращаемся в корзину и оттуда идём к оформлению.
+    await login(page, s.customer.email, "/cart");
+    await page.getByRole("link", { name: "Оформить заказ" }).click();
     await expect(page.getByRole("heading", { name: "Оформление заказа" })).toBeVisible();
     const submit = page.getByRole("button", { name: "Подтвердить заказ" });
     await submit.scrollIntoViewIfNeeded();

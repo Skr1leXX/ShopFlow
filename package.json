@@ -8,27 +8,28 @@
     "start": "next start",
     "lint": "eslint",
     "typecheck": "next typegen && tsc --noEmit",
-    "test:db": "node supabase/tests/rls.test.mjs && node supabase/tests/bundle.test.mjs",
+    "test:db": "node --test db/core.test.mjs",
     "seed:generate": "node scripts/gen-seed.mjs",
-    "seed:demo": "node --env-file=.env.local scripts/seed-demo.mjs",
+    "seed:demo": "node --env-file-if-exists=.env.local scripts/seed-demo.mjs",
     "test:unit": "node --test src/lib/csv.test.ts scripts/env-check.test.mjs scripts/scan-secrets.test.mjs",
     "test:static": "node scripts/check-build.mjs",
     "e2e": "playwright test",
     "e2e:desktop": "playwright test --project=desktop",
     "e2e:report": "playwright show-report e2e-report",
-    "test": "npm run typecheck && npm run lint && npm run test:unit && npm run db:bundle:check && npm run test:db && npm run scan:secrets",
+    "test": "npm run typecheck && npm run lint && npm run test:unit && npm run test:db && npm run scan:secrets",
     "prebuild": "node scripts/env-check.mjs --guard",
     "check:env": "node --env-file-if-exists=.env.local scripts/env-check.mjs",
     "scan:secrets": "node scripts/scan-secrets.mjs",
-    "db:bundle": "node scripts/bundle-sql.mjs",
-    "db:bundle:check": "node scripts/bundle-sql.mjs --check",
     "screenshots": "node --env-file-if-exists=.env.local scripts/screenshots.mjs",
-    "verify": "npm run test && npm run build && npm run test:static"
+    "verify": "npm run test && npm run build && npm run test:static",
+    "db:migrate": "node --env-file-if-exists=.env.local scripts/migrate.mjs",
+    "db:setup": "node --env-file-if-exists=.env.local scripts/migrate.mjs --seed",
+    "make-admin": "node --env-file-if-exists=.env.local scripts/make-admin.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.9.0",
-    "@supabase/ssr": "^0.12.7",
-    "@supabase/supabase-js": "^2.119.0",
+    "@libsql/client": "^0.18.0",
+    "@vercel/blob": "^2.9.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "lucide-react": "^1.70.0",
@@ -42,7 +43,6 @@
     "zustand": "^5.1.0"
   },
   "devDependencies": {
-    "@electric-sql/pglite": "^0.5.15",
     "@playwright/test": "^1.65.0",
     "@tailwindcss/turbopack": "^4",
     "@types/node": "^20",
@@ -56,5 +56,5 @@
   "engines": {
     "node": ">=20.9.0"
   },
-  "description": "ShopFlow: интернет-магазин одежды и аксессуаров на Next.js и Supabase"
+  "description": "ShopFlow: интернет-магазин одежды и аксессуаров на Next.js и Turso (libSQL)"
 }

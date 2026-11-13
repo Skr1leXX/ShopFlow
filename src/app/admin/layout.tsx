@@ -3,7 +3,7 @@ import { BarChart3, Boxes, FolderTree, Package, Settings, ShoppingBag, Tag, User
 import { Logo } from "@/components/layout/header";
 import { SetupNotice } from "@/components/common/states";
 import { requireAdmin } from "@/lib/auth";
-import { isSupabaseConfigured } from "@/lib/supabase/env";
+import { isDbConfigured } from "@/lib/env";
 
 export const metadata = { title: { default: "Админ-панель", template: "%s · Админ ShopFlow" }, robots: { index: false } };
 
@@ -19,7 +19,7 @@ const NAV = [
 ];
 
 export default async function AdminLayout({ children }: { children: React.ReactNode }) {
-  if (!isSupabaseConfigured) return <SetupNotice />;
+  if (!isDbConfigured) return <SetupNotice />;
   // Роль проверяется на сервере по данным БД; без неё страница не отрисовывается.
   const admin = await requireAdmin();
   return (

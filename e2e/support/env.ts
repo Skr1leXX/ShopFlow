@@ -1,9 +1,9 @@
 import path from "node:path";
 
-/** Сценарии с данными требуют настоящий проект Supabase (миграции применены) и сервисный ключ только для подготовки данных. */
-export const hasBackend = Boolean(
-  process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY && process.env.SUPABASE_SERVICE_ROLE_KEY,
-);
+/** Сценарии с данными требуют базу (TURSO_DATABASE_URL: Turso или локальный файл) — миграции применит global-setup. */
+export const hasBackend = Boolean(process.env.TURSO_DATABASE_URL);
+/** Загрузка фото работает только с токеном Vercel Blob; без него проверяется понятное сообщение. */
+export const hasBlob = Boolean(process.env.BLOB_READ_WRITE_TOKEN);
 
 export const PASSWORD = "E2e-Passw0rd!x";
 export const STATE_FILE = path.join(__dirname, "..", ".state.json");

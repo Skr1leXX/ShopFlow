@@ -3,13 +3,17 @@
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { z } from "zod";
-import { createClient } from "@/lib/supabase/server";
+import { db } from "@/lib/db";
 import { getUser } from "@/lib/auth";
-import { CARD } from "@/lib/data/catalog";
+import { addLine, setLineQuantity } from "@/lib/core/cart";
+import { all, BizError, flag, one, placeholders } from "@/lib/core/db";
+import { placeOrder as createOrder, quoteOrder as quote, type Quote } from "@/lib/core/orders";
+import { hydrateProducts } from "@/lib/data/shape";
 import type { CartLine } from "@/lib/data/types";
 import type { FormState } from "./auth";
 
 export type ActionResult = { ok: true; message?: string } | { ok: false; error: string };
+export type { Quote };
 
 async function needUser(next: string) {
   const user = await getUser();
@@ -19,46 +23,20 @@ async function needUser(next: string) {
 
 const uuid = z.string().uuid();
 
-/** Сообщения бизнес-правил (raise exception, P0001) безопасны для показа; остальные ошибки БД скрываем. */
-const dbMessage = (e: { code?: string; message: string }) =>
-  e.code === "P0001" ? e.message : "Не удалось выполнить операцию. Попробуйте ещё раз.";
+/** Тексты бизнес-правил (BizError) безопасны для показа; остальные ошибки скрываем. */
+const errText = (e: unknown, fallback = "Не удалось выполнить операцию. Попробуйте ещё раз.") => (e instanceof BizError ? e.message : fallback);
 
 // ───────── корзина ─────────
-type Db = Awaited<ReturnType<typeof createClient>>;
-
-/** Добавляет вариант в корзину пользователя, не превышая остаток. Возвращает фактическое количество добавленного. */
-type AddResult = { error: string } | { error?: undefined; capped: boolean; total: number };
-async function addLine(supabase: Db, userId: string, variantId: string, quantity: number): Promise<AddResult> {
-  const qty = Math.min(99, Math.max(1, Math.floor(quantity)));
-  const { data: variant } = await supabase
-    .from("product_variants").select("is_active, products(is_active), inventory(quantity)").eq("id", variantId).maybeSingle();
-  const v = variant as unknown as { is_active: boolean; products: { is_active: boolean } | null; inventory: { quantity: number } | null } | null;
-  const available = v?.is_active && v.products?.is_active ? v.inventory?.quantity ?? 0 : 0;
-  if (available < 1) return { error: "Этого варианта нет в наличии" };
-
-  let { data: cart } = await supabase.from("carts").select("id").eq("user_id", userId).maybeSingle();
-  if (!cart) {
-    const created = await supabase.from("carts").insert({ user_id: userId }).select("id").single();
-    if (created.error) return { error: "Не удалось создать корзину" };
-    cart = created.data;
-  }
-  const { data: existing } = await supabase
-    .from("cart_items").select("id,quantity").eq("cart_id", cart.id).eq("variant_id", variantId).maybeSingle();
-  const total = Math.min(available, 99, (existing?.quantity ?? 0) + qty);
-  const { error } = existing
-    ? await supabase.from("cart_items").update({ quantity: total }).eq("id", existing.id)
-    : await supabase.from("cart_items").insert({ cart_id: cart.id, variant_id: variantId, quantity: total });
-  if (error) return { error: "Не удалось добавить товар" };
-  return { capped: total < (existing?.quantity ?? 0) + qty, total };
-}
-
 export async function addToCart(variantId: string, quantity: number, returnTo: string): Promise<ActionResult> {
   const user = await needUser(returnTo);
   if (!uuid.safeParse(variantId).success) return { ok: false, error: "Выберите размер и цвет" };
-  const res = await addLine(await createClient(), user.id, variantId, quantity);
-  if (res.error !== undefined) return { ok: false, error: res.error };
-  revalidatePath("/", "layout");
-  return { ok: true, message: res.capped ? `В корзину добавлено максимум: ${res.total} шт.` : "Товар добавлен в корзину" };
+  try {
+    const res = await addLine(db(), user.id, variantId, quantity);
+    revalidatePath("/", "layout");
+    return { ok: true, message: res.capped ? `В корзину добавлено максимум: ${res.total} шт.` : "Товар добавлен в корзину" };
+  } catch (e) {
+    return { ok: false, error: errText(e, "Не удалось добавить товар") };
+  }
 }
 
 /** Объединяет гостевую корзину (из браузера) с корзиной пользователя. Данным из браузера не доверяем: остатки проверяются заново. */
@@ -67,11 +45,9 @@ export async function mergeGuestCart(items: { variantId: string; quantity: numbe
   if (!user) return { ok: false, error: "Требуется вход" };
   const parsed = z.array(z.object({ variantId: uuid, quantity: z.number().int().min(1).max(99) })).max(50).safeParse(items);
   if (!parsed.success) return { ok: false, error: "Некорректная гостевая корзина" };
-  const supabase = await createClient();
   let skipped = 0;
   for (const it of parsed.data) {
-    const res = await addLine(supabase, user.id, it.variantId, it.quantity);
-    if (res.error !== undefined) skipped++;
+    try { await addLine(db(), user.id, it.variantId, it.quantity); } catch { skipped++; }
   }
   revalidatePath("/", "layout");
   return { ok: true, skipped };
@@ -81,35 +57,42 @@ export async function mergeGuestCart(items: { variantId: string; quantity: numbe
 export async function getGuestLines(variantIds: string[]) {
   const ids = z.array(uuid).max(50).safeParse(variantIds);
   if (!ids.success || !ids.data.length) return [];
-  const supabase = await createClient();
-  const { data } = await supabase
-    .from("product_variants")
-    .select(`id,sku,size,color,color_hex,is_active,inventory(quantity), products(${CARD})`)
-    .in("id", ids.data);
-  return (data ?? []).filter((v) => v.is_active) as unknown as CartLine["variant"][];
+  const rows = await all(
+    db(),
+    `select pv.id, pv.product_id, pv.sku, pv.size, pv.color, pv.color_hex, pv.is_active, i.quantity
+     from product_variants pv left join inventory i on i.variant_id = pv.id where pv.is_active = 1 and pv.id in (${placeholders(ids.data.length)})`,
+    ids.data,
+  );
+  const pids = [...new Set(rows.map((r) => r.product_id as string))];
+  const products = new Map(
+    (pids.length ? await hydrateProducts(await all(db(), `select * from products where id in (${placeholders(pids.length)})`, pids)) : []).map((p) => [p.id, p]),
+  );
+  return rows.map((r) => ({
+    id: r.id, sku: r.sku, size: r.size, color: r.color, color_hex: r.color_hex, is_active: flag(r.is_active),
+    inventory: r.quantity === null ? null : { quantity: r.quantity }, products: products.get(r.product_id as string),
+  })) as unknown as CartLine["variant"][];
 }
 
 export async function setCartQuantity(itemId: string, quantity: number): Promise<ActionResult> {
-  await needUser("/cart");
+  const user = await needUser("/cart");
   if (!uuid.safeParse(itemId).success) return { ok: false, error: "Некорректный товар" };
-  const supabase = await createClient();
-  const { data: item } = await supabase.from("cart_items").select("variant_id").eq("id", itemId).maybeSingle();
-  if (!item) return { ok: false, error: "Товар не найден в корзине" };
-  const { data: stock } = await supabase.from("inventory").select("quantity").eq("variant_id", item.variant_id).maybeSingle();
-  const qty = Math.min(stock?.quantity ?? 0, 99, Math.max(1, Math.floor(quantity)));
-  if (qty < 1) return { ok: false, error: "Товара нет в наличии" };
-  const { error } = await supabase.from("cart_items").update({ quantity: qty }).eq("id", itemId);
-  if (error) return { ok: false, error: "Не удалось изменить количество" };
+  try {
+    await setLineQuantity(db(), user.id, itemId, quantity);
+  } catch (e) {
+    return { ok: false, error: errText(e, "Не удалось изменить количество") };
+  }
   revalidatePath("/", "layout");
   return { ok: true };
 }
 
 export async function removeCartItem(itemId: string): Promise<ActionResult> {
-  await needUser("/cart");
+  const user = await needUser("/cart");
   if (!uuid.safeParse(itemId).success) return { ok: false, error: "Некорректный товар" };
-  const supabase = await createClient();
-  const { error } = await supabase.from("cart_items").delete().eq("id", itemId);
-  if (error) return { ok: false, error: "Не удалось удалить товар" };
+  try {
+    await db().execute({ sql: "delete from cart_items where id = ? and user_id = ?", args: [itemId, user.id] });
+  } catch {
+    return { ok: false, error: "Не удалось удалить товар" };
+  }
   revalidatePath("/", "layout");
   return { ok: true };
 }
@@ -118,27 +101,27 @@ export async function removeCartItem(itemId: string): Promise<ActionResult> {
 export async function toggleFavorite(productId: string, returnTo: string): Promise<ActionResult & { active?: boolean }> {
   const user = await needUser(returnTo);
   if (!uuid.safeParse(productId).success) return { ok: false, error: "Некорректный товар" };
-  const supabase = await createClient();
-  const { data: existing } = await supabase.from("favorites").select("product_id").eq("product_id", productId).maybeSingle();
-  const { error } = existing
-    ? await supabase.from("favorites").delete().eq("product_id", productId)
-    : await supabase.from("favorites").insert({ user_id: user.id, product_id: productId });
-  if (error) return { ok: false, error: "Не удалось обновить избранное" };
-  revalidatePath("/", "layout");
-  return { ok: true, active: !existing };
+  try {
+    const existing = await one(db(), "select 1 from favorites where user_id = ? and product_id = ?", [user.id, productId]);
+    if (existing) await db().execute({ sql: "delete from favorites where user_id = ? and product_id = ?", args: [user.id, productId] });
+    else await db().execute({ sql: "insert or ignore into favorites (user_id, product_id) select ?, id from products where id = ?", args: [user.id, productId] });
+    revalidatePath("/", "layout");
+    return { ok: true, active: !existing };
+  } catch {
+    return { ok: false, error: "Не удалось обновить избранное" };
+  }
 }
 
 // ───────── расчёт и оформление заказа ─────────
-export type Quote = { subtotal: number; discount: number; shipping: number; total: number };
-
 export async function quoteOrder(promo: string, delivery: string): Promise<{ ok: true; quote: Quote } | { ok: false; error: string }> {
-  await needUser("/cart");
+  const user = await needUser("/cart");
   const method = z.enum(["courier", "pickup", "post"]).safeParse(delivery);
   if (!method.success) return { ok: false, error: "Выберите способ доставки" };
-  const supabase = await createClient();
-  const { data, error } = await supabase.rpc("quote_order", { p_promo: promo.trim() || null, p_delivery: method.data });
-  if (error) return { ok: false, error: dbMessage(error) };
-  return { ok: true, quote: data as Quote };
+  try {
+    return { ok: true, quote: await quote(db(), user.id, promo.trim() || null, method.data) };
+  } catch (e) {
+    return { ok: false, error: errText(e) };
+  }
 }
 
 const orderSchema = z.object({
@@ -156,22 +139,25 @@ const orderSchema = z.object({
 });
 
 export async function placeOrder(_: FormState, form: FormData): Promise<FormState> {
-  await needUser("/checkout");
+  const user = await needUser("/checkout");
   const parsed = orderSchema.safeParse(Object.fromEntries(form));
   if (!parsed.success) return { error: parsed.error.issues[0].message };
   const v = parsed.data;
   if (v.delivery !== "pickup" && (!v.city || !v.street || !v.postal_code))
     return { error: "Укажите город, улицу и индекс для доставки" };
 
-  const supabase = await createClient();
-  const { data, error } = await supabase.rpc("place_order", {
-    p_name: v.name, p_email: v.email, p_phone: v.phone, p_delivery: v.delivery, p_payment: v.payment,
-    p_address: v.delivery === "pickup" ? {} : { city: v.city, street: v.street, postal_code: v.postal_code },
-    p_comment: v.comment ?? "", p_promo: v.promo || null, p_key: v.key,
-  });
-  if (error) return { error: dbMessage(error) };
+  let id: string;
+  try {
+    id = await createOrder(db(), user.id, {
+      name: v.name, email: v.email, phone: v.phone, delivery: v.delivery, payment: v.payment,
+      address: { city: v.city, street: v.street, postal_code: v.postal_code },
+      comment: v.comment, promo: v.promo || null, key: v.key,
+    });
+  } catch (e) {
+    return { error: errText(e) };
+  }
   revalidatePath("/", "layout");
-  redirect(`/account/orders/${data}?placed=1`);
+  redirect(`/account/orders/${id}?placed=1`);
 }
 
 // ───────── профиль и адреса ─────────
@@ -182,10 +168,14 @@ export async function updateProfile(_: FormState, form: FormData): Promise<FormS
     .safeParse(Object.fromEntries(form));
   if (!parsed.success) return { error: parsed.error.issues[0].message };
   if (parsed.data.phone && parsed.data.phone.length < 5) return { error: "Телефон слишком короткий" };
-  const supabase = await createClient();
-  const { error } = await supabase
-    .from("profiles").update({ full_name: parsed.data.full_name, phone: parsed.data.phone || null }).eq("id", user.id);
-  if (error) return { error: "Не удалось сохранить профиль" };
+  try {
+    await db().execute({
+      sql: "update profiles set full_name = ?, phone = ?, updated_at = ? where id = ?",
+      args: [parsed.data.full_name, parsed.data.phone || null, new Date().toISOString(), user.id],
+    });
+  } catch {
+    return { error: "Не удалось сохранить профиль" };
+  }
   revalidatePath("/account");
   return { message: "Профиль сохранён" };
 }
@@ -203,20 +193,28 @@ export async function addAddress(_: FormState, form: FormData): Promise<FormStat
     })
     .safeParse(Object.fromEntries(form));
   if (!parsed.success) return { error: parsed.error.issues[0].message };
-  const supabase = await createClient();
-  const { count } = await supabase.from("addresses").select("id", { count: "exact", head: true });
-  const { error } = await supabase.from("addresses").insert({ ...parsed.data, user_id: user.id, is_default: !count });
-  if (error) return { error: "Не удалось сохранить адрес" };
+  const a = parsed.data;
+  try {
+    await db().execute({
+      sql: `insert into addresses (id, user_id, label, recipient, phone, city, street, postal_code, is_default)
+            values (?, ?, ?, ?, ?, ?, ?, ?, not exists (select 1 from addresses where user_id = ?))`,
+      args: [crypto.randomUUID(), user.id, a.label, a.recipient, a.phone, a.city, a.street, a.postal_code, user.id],
+    });
+  } catch {
+    return { error: "Не удалось сохранить адрес" };
+  }
   revalidatePath("/account/addresses");
   return { message: "Адрес добавлен" };
 }
 
 export async function deleteAddress(id: string): Promise<ActionResult> {
-  await needUser("/account/addresses");
+  const user = await needUser("/account/addresses");
   if (!uuid.safeParse(id).success) return { ok: false, error: "Некорректный адрес" };
-  const supabase = await createClient();
-  const { error } = await supabase.from("addresses").delete().eq("id", id);
-  if (error) return { ok: false, error: "Не удалось удалить адрес" };
+  try {
+    await db().execute({ sql: "delete from addresses where id = ? and user_id = ?", args: [id, user.id] });
+  } catch {
+    return { ok: false, error: "Не удалось удалить адрес" };
+  }
   revalidatePath("/account/addresses");
   return { ok: true };
 }

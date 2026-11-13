@@ -1,6 +1,6 @@
 "use client";
 
-import { useActionState, useTransition, type ReactNode } from "react";
+import { startTransition, useActionState, useTransition, type ReactNode } from "react";
 import { Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -39,7 +39,12 @@ export function ActionForm({
   }, undefined);
   return (
     <form
-      action={formAction}
+      // Не через action={...}: React 19 очищает поля формы после любого действия, и при ошибке валидации пользователь терял бы ввод.
+      onSubmit={(e) => {
+        e.preventDefault();
+        const data = new FormData(e.currentTarget);
+        startTransition(() => formAction(data));
+      }}
       className={cn("space-y-4", className)}
       ref={(el) => { if (el && resetOnSuccess && state?.message) el.reset(); }}
     >

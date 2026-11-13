@@ -1,19 +1,26 @@
 // Демо-данные для показа: аккаунты администратора и покупателей, адреса, избранное и заказы за последние ~4 недели.
-// Нужны NEXT_PUBLIC_SUPABASE_URL и SUPABASE_SERVICE_ROLE_KEY (только локально: node --env-file=.env.local scripts/seed-demo.mjs).
-// Пароль: DEMO_PASSWORD или случайный (печатается один раз). Все данные вымышленные: домен .demo, телефоны 555.
+// Заказы создаются тем же кодом, что и в магазине (placeOrder / setOrderStatus), поэтому остатки и журнал склада согласованы.
+// Нужен TURSO_DATABASE_URL (+ TURSO_AUTH_TOKEN для облачной базы); миграции и каталог: npm run db:setup.
+// Запуск: npm run seed:demo. Пароль: DEMO_PASSWORD или случайный (печатается один раз). Все данные вымышленные: домен .demo, телефоны 555.
 // Повторный запуск безопасен: пользователи обновляются, заказы создаются только если их ещё нет.
-import { randomBytes } from "node:crypto";
-import { createClient } from "@supabase/supabase-js";
+import { randomBytes, randomUUID } from "node:crypto";
+import { createClient } from "@libsql/client";
+import { addLine } from "../src/lib/core/cart.ts";
+import { adjustStock, placeOrder, setOrderStatus } from "../src/lib/core/orders.ts";
+import { hashPassword } from "../src/lib/core/password.ts";
 
-const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-if (!url || !key) {
-  console.error("Задайте NEXT_PUBLIC_SUPABASE_URL и SUPABASE_SERVICE_ROLE_KEY (npm run seed:demo читает .env.local)");
+const url = process.env.TURSO_DATABASE_URL;
+if (!url) {
+  console.error("Задайте TURSO_DATABASE_URL (npm run seed:demo читает .env.local) и выполните npm run db:setup");
   process.exit(1);
 }
-const db = createClient(url, key, { auth: { autoRefreshToken: false, persistSession: false } });
+const db = createClient({ url, authToken: process.env.TURSO_AUTH_TOKEN });
 const password = process.env.DEMO_PASSWORD ?? randomBytes(9).toString("base64url");
 if (password.length < 8) { console.error("DEMO_PASSWORD должен быть не короче 8 символов"); process.exit(1); }
+if ((await db.execute("select count(*) n from products")).rows[0].n === 0) {
+  console.error("В базе нет каталога: сначала выполните npm run db:setup");
+  process.exit(1);
+}
 
 const USERS = [
   { email: "admin@shopflow.demo", name: "Администратор Демо", role: "admin", phone: "+7 555 000-00-01" },
@@ -27,7 +34,7 @@ const ADDRESS = {
   "maria@shopflow.demo": { label: "Дом", city: "Новосибирск", street: "ул. Демонстрационная, д. 3, кв. 40", postal_code: "630000" },
 };
 
-// Заказы: [пользователь, статус, доставка, оплата, дней назад, промокод?, [[slug, размер, кол-во], …]]
+// Заказы: [пользователь, конечный статус, доставка, оплата, дней назад, промокод?, [[slug, размер, кол-во], …]]
 const ORDERS = [
   ["anna@shopflow.demo", "delivered", "courier", "card", 26, null, [["linen-shirt", "M", 1], ["jeans-straight", "30", 1]]],
   ["ivan@shopflow.demo", "delivered", "pickup", "cash", 22, null, [["sneakers-court", "42", 1]]],
@@ -39,77 +46,61 @@ const ORDERS = [
   ["ivan@shopflow.demo", "cancelled", "courier", "card", 12, null, [["boots-chelsea", "43", 1]]],
 ];
 const FAVORITES = { "anna@shopflow.demo": ["bomber-core", "watch-minimal", "sneakers-runner"], "maria@shopflow.demo": ["blazer-soft", "tote-canvas"] };
-
-async function ensureUser(u) {
-  const { data: list } = await db.auth.admin.listUsers({ perPage: 1000 });
-  let user = list?.users.find((x) => x.email === u.email);
-  if (!user) {
-    const { data, error } = await db.auth.admin.createUser({ email: u.email, password, email_confirm: true, user_metadata: { full_name: u.name } });
-    if (error) throw error;
-    user = data.user;
-  } else if (process.env.DEMO_PASSWORD) {
-    await db.auth.admin.updateUserById(user.id, { password });
-  }
-  // Роль меняется только здесь, через service role: клиентам это запрещено триггером и RLS.
-  const { error } = await db.from("profiles").update({ role: u.role, full_name: u.name, phone: u.phone }).eq("id", user.id);
-  if (error) throw error;
-  return user.id;
-}
+// Путь статусов до конечного (отмена — прямо из «Новый»).
+const PATH = { pending: [], paid: ["paid"], processing: ["paid", "processing"], shipped: ["paid", "processing", "shipped"], delivered: ["paid", "processing", "shipped", "delivered"], cancelled: ["cancelled"] };
 
 const ids = {};
-for (const u of USERS) ids[u.email] = await ensureUser(u);
-
-// адреса и избранное
-for (const [email, a] of Object.entries(ADDRESS)) {
-  const { count } = await db.from("addresses").select("id", { count: "exact", head: true }).eq("user_id", ids[email]);
-  if (!count) {
-    const u = USERS.find((x) => x.email === email);
-    await db.from("addresses").insert({ ...a, user_id: ids[email], recipient: u.name, phone: u.phone, is_default: true }).throwOnError();
+const hash = await hashPassword(password);
+for (const u of USERS) {
+  const found = (await db.execute({ sql: "select id from profiles where email = ?", args: [u.email] })).rows[0];
+  if (found) {
+    ids[u.email] = found.id;
+    await db.execute({ sql: `update profiles set role = ?, full_name = ?, phone = ?${process.env.DEMO_PASSWORD ? ", password_hash = ?" : ""} where id = ?`, args: [u.role, u.name, u.phone, ...(process.env.DEMO_PASSWORD ? [hash] : []), found.id] });
+  } else {
+    ids[u.email] = randomUUID();
+    await db.execute({ sql: "insert into profiles (id, email, password_hash, full_name, phone, role) values (?, ?, ?, ?, ?, ?)", args: [ids[u.email], u.email, hash, u.name, u.phone, u.role] });
   }
 }
-for (const [email, slugs] of Object.entries(FAVORITES)) {
-  const { data: prods } = await db.from("products").select("id").in("slug", slugs);
-  await db.from("favorites").upsert((prods ?? []).map((p) => ({ user_id: ids[email], product_id: p.id })), { ignoreDuplicates: true });
-}
 
-const { count: existing } = await db.from("orders").select("id", { count: "exact", head: true }).in("user_id", Object.values(ids));
+for (const [email, a] of Object.entries(ADDRESS)) {
+  const n = (await db.execute({ sql: "select count(*) n from addresses where user_id = ?", args: [ids[email]] })).rows[0].n;
+  const u = USERS.find((x) => x.email === email);
+  if (!n) await db.execute({ sql: "insert into addresses (id, user_id, label, recipient, phone, city, street, postal_code, is_default) values (?, ?, ?, ?, ?, ?, ?, ?, 1)", args: [randomUUID(), ids[email], a.label, u.name, u.phone, a.city, a.street, a.postal_code] });
+}
+for (const [email, slugs] of Object.entries(FAVORITES))
+  for (const slug of slugs)
+    await db.execute({ sql: "insert or ignore into favorites (user_id, product_id) select ?, id from products where slug = ?", args: [ids[email], slug] });
+
+const placeholders = Object.values(ids).map(() => "?").join(",");
+const existing = (await db.execute({ sql: `select count(*) n from orders where user_id in (${placeholders})`, args: Object.values(ids) })).rows[0].n;
 if (existing) {
   console.log(`Демо-заказы уже есть (${existing}), пропускаю создание.`);
 } else {
   const variantOf = async (slug, size) => {
-    const { data } = await db.from("product_variants").select("id,size,color,products!inner(id,name,price,slug,product_images(url,sort_order))").eq("products.slug", slug).eq("size", size).limit(1);
-    if (!data?.length) throw new Error(`В каталоге нет варианта ${slug} / ${size}: сначала выполните supabase/seed.sql`);
-    return data[0];
+    const r = (await db.execute({ sql: "select pv.id, coalesce(i.quantity, 0) stock from product_variants pv join products p on p.id = pv.product_id left join inventory i on i.variant_id = pv.id where p.slug = ? and pv.size = ? limit 1", args: [slug, size] })).rows[0];
+    if (!r) throw new Error(`В каталоге нет варианта ${slug} / ${size}: сначала выполните npm run db:setup`);
+    return r;
   };
-  const { data: promos } = await db.from("promo_codes").select("id,discount_percent,code");
-  let created = 0;
-  for (const [email, status, delivery, payment, daysAgo, promoCode, lines] of ORDERS) {
-    const items = [];
-    for (const [slug, size, qty] of lines) items.push({ v: await variantOf(slug, size), qty });
-    const subtotal = items.reduce((s, i) => s + Number(i.v.products.price) * i.qty, 0);
-    const promo = promoCode ? promos?.find((p) => p.code === promoCode) : null;
-    const discount = promo ? Math.round((subtotal * promo.discount_percent) / 100) : 0;
-    const shipping = delivery === "pickup" || subtotal - discount >= 15000 ? 0 : delivery === "courier" ? 490 : 290;
+  for (const [email, status, delivery, payment, daysAgo, promo, lines] of ORDERS) {
     const u = USERS.find((x) => x.email === email);
+    for (const [slug, size, qty] of lines) {
+      const v = await variantOf(slug, size);
+      if (v.stock < qty) await adjustStock(db, { variantId: v.id, delta: qty - v.stock + 3, reason: "receipt", note: "Поставка под демо-заказы" });
+      await addLine(db, ids[email], v.id, qty);
+    }
+    const orderId = await placeOrder(db, ids[email], {
+      name: u.name, email: u.email, phone: u.phone, delivery, payment, promo,
+      address: delivery === "pickup" ? null : (({ city, street, postal_code }) => ({ city, street, postal_code }))(ADDRESS[email]),
+    });
+    for (const s of PATH[status]) await setOrderStatus(db, orderId, s);
+    // Задним числом: заказы и движения по складу «случились» daysAgo дней назад.
     const when = new Date(Date.now() - daysAgo * 86_400_000).toISOString();
-    const { data: order, error } = await db.from("orders").insert({
-      user_id: ids[email], status, subtotal, discount, shipping, total: subtotal - discount + shipping, promo_code_id: promo?.id ?? null,
-      contact_name: u.name, contact_email: u.email, contact_phone: u.phone, delivery_method: delivery, payment_method: payment,
-      shipping_address: delivery === "pickup" ? {} : (({ city, street, postal_code }) => ({ city, street, postal_code }))(ADDRESS[email]),
-      created_at: when, updated_at: when,
-    }).select("id").single();
-    if (error) throw error;
-    await db.from("order_items").insert(items.map(({ v, qty }) => ({
-      order_id: order.id, variant_id: v.id, product_id: v.products.id, product_name: v.products.name, size: v.size, color: v.color,
-      image_url: [...v.products.product_images].sort((a, b) => a.sort_order - b.sort_order)[0]?.url ?? null, unit_price: v.products.price, quantity: qty,
-    }))).throwOnError();
-    created++;
+    await db.execute({ sql: "update orders set created_at = ?, updated_at = ? where id = ?", args: [when, when, orderId] });
+    await db.execute({ sql: "update inventory_movements set created_at = ? where order_id = ?", args: [when, orderId] });
   }
-  const used = ORDERS.filter((o) => o[5] === "WELCOME10").length;
-  if (used) await db.from("promo_codes").update({ used_count: used }).eq("code", "WELCOME10");
-  console.log(`Создано демо-заказов: ${created} (остатки они не списывают: заказы вставлены напрямую)`);
+  console.log(`Создано демо-заказов: ${ORDERS.length} (через тот же код, что и в магазине: остатки и журнал склада согласованы)`);
 }
 
-console.log("\nДемо-аккаунты (вымышленные, только для демонстрационного проекта):");
+console.log("\nДемо-аккаунты (вымышленные, только для демонстрационной базы):");
 USERS.forEach((u) => console.log(`  ${u.role.padEnd(8)} ${u.email}`));
 console.log(`Пароль: ${process.env.DEMO_PASSWORD ? "(значение DEMO_PASSWORD)" : password}`);

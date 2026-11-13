@@ -4,16 +4,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-const jwtRole = (token) => {
-  try { return JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString()).role ?? null; } catch { return null; }
-};
-
 const RULES = [
-  { name: "JWT с ролью service_role", re: /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}/g, test: (m) => jwtRole(m) === "service_role" },
-  { name: "Supabase secret key", re: /sb_secret_[A-Za-z0-9_-]{8,}/g },
+  { name: "JWT (токен доступа)", re: /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}/g },
   { name: "приватный ключ", re: /-----BEGIN [A-Z ]*PRIVATE KEY-----/g },
   { name: "строка подключения к БД с паролем", re: /postgres(?:ql)?:\/\/[^\s:@/]+:[^\s@/]{3,}@[^\s/]+/g, test: (m) => !/:(password|\[YOUR-PASSWORD\]|your-password|postgres)@/i.test(m) },
-  { name: "непустое значение SUPABASE_SERVICE_ROLE_KEY", re: /SUPABASE_SERVICE_ROLE_KEY[ \t]*[=:][ \t]*["']?([A-Za-z0-9._-]{20,})/g },
+  { name: "адрес базы libsql с токеном в URL", re: /libsql:\/\/[^\s"']*authToken=[^\s"'&]{10,}/g },
+  { name: "непустое значение TURSO_AUTH_TOKEN", re: /TURSO_AUTH_TOKEN[ \t]*[=:][ \t]*["']?(eyJ[A-Za-z0-9._-]{20,}|[A-Za-z0-9._-]{40,})/g },
+  { name: "токен Vercel Blob", re: /vercel_blob_rw_[A-Za-z0-9_]{10,}/g },
   { name: "токен GitHub", re: /\bgh[pousr]_[A-Za-z0-9]{30,}\b/g },
   { name: "ключ API (sk-…)", re: /\bsk-[A-Za-z0-9]{32,}\b/g },
   { name: "ключ AWS", re: /\bAKIA[0-9A-Z]{16}\b/g },

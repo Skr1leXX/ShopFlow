@@ -81,7 +81,7 @@ export function CartView({ lines, guest = false }: { lines: CartLine[]; guest?: 
                     <span className="w-8 text-center text-sm">{l.quantity}</span>
                     <button type="button" aria-label="Больше" disabled={pending || l.quantity >= Math.min(stock, 99)} onClick={() => setQty(l, l.quantity + 1)} className="grid size-10 place-items-center disabled:opacity-30"><Plus className="size-4" /></button>
                   </div>
-                  <button type="button" disabled={pending} onClick={() => remove(l)} className="flex items-center gap-1.5 text-sm text-muted-foreground transition-colors hover:text-destructive">
+                  <button type="button" disabled={pending} onClick={() => remove(l)} className="flex min-h-8 items-center gap-1.5 text-sm text-muted-foreground transition-colors hover:text-destructive">
                     <Trash2 className="size-4" /> Удалить
                   </button>
                 </div>

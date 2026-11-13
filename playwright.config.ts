@@ -1,6 +1,9 @@
 import fs from "node:fs";
 import { defineConfig, devices } from "@playwright/test";
 
+// Переменные из .env.local нужны и тестам (доступ к базе), и серверу, который запускает Playwright.
+try { process.loadEnvFile(".env.local"); } catch { /* файла может не быть: тогда сценарии с данными пропускаются */ }
+
 const PORT = 3300;
 // Браузер: E2E_BROWSER_PATH, иначе установленный Edge/Chrome (чтобы не скачивать бинарники), иначе Chromium от Playwright
 // (`npx playwright install chromium`).

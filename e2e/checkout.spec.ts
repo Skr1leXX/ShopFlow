@@ -1,9 +1,9 @@
 import { expect, test, type Page } from "@playwright/test";
-import { admin, ordersOf, readState, resetCustomerData, setStockDirect, stockOf } from "./support/db";
+import { ordersOf, readState, resetCustomerData, setStockDirect, sqlRun, sqlVal, stockOf } from "./support/db";
 import { hasBackend } from "./support/env";
 import { addToCartOnProduct, login, normalize, trackErrors, alertOf } from "./support/helpers";
 
-test.skip(!hasBackend, "нужен проект Supabase (см. e2e/README.md)");
+test.skip(!hasBackend, "нужна база данных (TURSO_DATABASE_URL, см. e2e/README.md)");
 test.describe.configure({ mode: "serial" });
 
 const summary = async (page: Page) => normalize(await page.locator("aside").last().innerText());
@@ -64,8 +64,7 @@ test.describe("оформление заказа", () => {
   test("полный сценарий: заказ, цены, остатки, корзина, личный кабинет", async ({ page }) => {
     const s = readState();
     const errors = trackErrors(page);
-    const db = admin();
-    const used0 = (await db.from("promo_codes").select("used_count").eq("code", s.promo).single()).data!.used_count;
+    const used0 = (await sqlVal("select used_count from promo_codes where code = ?", [s.promo])) as number;
 
     await page.goto("/cart");
     await page.getByRole("button", { name: "Больше" }).click();
@@ -90,7 +89,7 @@ test.describe("оформление заказа", () => {
     expect(Number(orders[0].total)).toBe(4090);
     expect(Number(orders[0].discount)).toBe(400);
     expect(await stockOf(s.products.tee.variantM)).toBe(3); // 5 − 2
-    expect((await db.from("promo_codes").select("used_count").eq("code", s.promo).single()).data!.used_count).toBe(used0 + 1);
+    expect(await sqlVal("select used_count from promo_codes where code = ?", [s.promo])).toBe(used0 + 1);
 
     // корзина очищена только после успешного создания
     await page.goto("/cart");
@@ -102,14 +101,15 @@ test.describe("оформление заказа", () => {
     expect(normalize(await page.locator("main").innerText())).toContain("4 090 ₽");
 
     // цена зафиксирована на момент покупки: изменение цены товара не меняет заказ
-    await db.from("products").update({ price: 99999, old_price: null }).eq("id", s.products.tee.id);
+    await sqlRun("update products set price = 99999, old_price = null where id = ?", [s.products.tee.id]);
     try {
       await page.goto(`/account/orders`);
       await page.getByText(`Заказ №${orders[0].number}`).click();
+      await expect(page).toHaveURL(/\/account\/orders\/[0-9a-f-]{36}/);
       expect(normalize(await page.locator("main").innerText())).toContain("2 000 ₽");
       expect(normalize(await page.locator("main").innerText())).not.toContain("99 999");
     } finally {
-      await db.from("products").update({ price: 2000, old_price: 2500 }).eq("id", s.products.tee.id);
+      await sqlRun("update products set price = 2000, old_price = 2500 where id = ?", [s.products.tee.id]);
     }
     expect(errors).toEqual([]);
   });
@@ -133,7 +133,7 @@ test.describe("оформление заказа", () => {
     await page.getByRole("button", { name: "Подтвердить заказ" }).click();
     await expect(alertOf(page)).toContainText("Недостаточно товара на складе");
     expect(await ordersOf(s.customer.id)).toHaveLength(0);
-    const { count } = await admin().from("cart_items").select("id, carts!inner(user_id)", { count: "exact", head: true }).eq("carts.user_id", s.customer.id);
+    const count = await sqlVal("select count(*) from cart_items where user_id = ?", [s.customer.id]);
     expect(count).toBe(1);
   });
 

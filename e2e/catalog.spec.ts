@@ -3,7 +3,7 @@ import { readState } from "./support/db";
 import { hasBackend } from "./support/env";
 import { normalize, trackErrors } from "./support/helpers";
 
-test.skip(!hasBackend, "нужен проект Supabase (см. e2e/README.md)");
+test.skip(!hasBackend, "нужна база данных (TURSO_DATABASE_URL, см. e2e/README.md)");
 
 // Все проверки идут в изолированной категории E2E: каталог проекта не влияет на результат.
 const url = (cat: string, qs = "") => `/catalog?category=e2e-${cat}${qs}`;
@@ -75,17 +75,17 @@ test.describe("каталог", () => {
     await page.goto(url(s.run));
     const aside = page.getByRole("complementary", { name: "Фильтры" });
 
-    await aside.getByLabel("E2EBrandB").check();
+    await aside.getByLabel("E2EBrandB").click(); // чекбокс обновляется после перехода по URL
     await expect(page).toHaveURL(/brand=E2EBrandB/);
     await expect(page.locator("article")).toHaveCount(1);
     await expect(page.locator("article")).toContainText(s.products.jacket.name);
 
-    await aside.getByLabel("E2EBrandB").uncheck();
+    await aside.getByLabel("E2EBrandB").click();
     await expect(page.locator("article")).toHaveCount(12);
 
-    await aside.getByRole("button", { name: "Синий" }).click();
+    await aside.getByRole("button", { name: "Синий", exact: true }).click();
     await expect(page.locator("article")).toHaveCount(1);
-    await aside.getByRole("button", { name: "Синий" }).click();
+    await aside.getByRole("button", { name: "Синий", exact: true }).click();
 
     await aside.getByLabel("Цена от").fill("1500");
     await aside.getByLabel("Цена до").fill("3000");
@@ -139,8 +139,9 @@ test.describe("каталог", () => {
     await expect(page.getByText("Выберите размер, чтобы увидеть наличие")).toBeVisible();
     await page.getByRole("button", { name: "M", exact: true }).click();
     await expect(page.getByText("В наличии")).toBeVisible();
-    const r = await page.goto("/product/no-such-product-e2e");
-    expect(r?.status()).toBe(404);
+    // Статус при потоковой отдаче страницы может быть 200 (loading.tsx), поэтому проверяем содержимое страницы 404.
+    await page.goto("/product/no-such-product-e2e");
+    await expect(page.getByRole("heading", { name: "Страница не найдена" })).toBeVisible();
     await expect(page.getByRole("heading", { name: "Страница не найдена" })).toBeVisible();
   });
 

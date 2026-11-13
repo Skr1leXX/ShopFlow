@@ -1,6 +1,6 @@
 import { SetupNotice } from "@/components/common/states";
 
-export const metadata = { title: "Настройка Supabase", robots: { index: false } };
+export const metadata = { title: "Настройка базы данных", robots: { index: false } };
 
 export default function SetupPage() {
   return (

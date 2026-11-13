@@ -1,6 +1,8 @@
 import "server-only";
 import { cache } from "react";
-import { createClient } from "@/lib/supabase/server";
+import { db } from "@/lib/db";
+import { all, one, placeholders } from "@/lib/core/db";
+import { hydrateProducts, likeTerm, toCategory } from "./shape";
 import type { Category, Product, ProductFull } from "./types";
 
 export const PAGE_SIZE = 12;
@@ -17,108 +19,75 @@ export type CatalogParams = {
   min?: number; max?: number; sort?: SortKey; page?: number;
 };
 
-export const CARD = "*, product_images(id,url,storage_path,alt,sort_order), categories(name,slug), stock:product_variants(is_active,inventory(quantity))";
-
-/** Убираем символы, ломающие синтаксис фильтра PostgREST. */
-const clean = (s: string) => s.replace(/[,()%*\\]/g, " ").trim();
-
 export const getCategories = cache(async (): Promise<Category[]> => {
-  const supabase = await createClient();
-  const { data, error } = await supabase.from("categories").select("*").eq("is_active", true).order("sort_order");
-  if (error) throw new Error(error.message);
-  return data as Category[];
+  return (await all(db(), "select * from categories where is_active = 1 order by sort_order, name")).map(toCategory);
 });
 
+const ORDER: Record<SortKey, string> = {
+  popular: "p.is_featured desc, p.created_at desc, p.id",
+  new: "p.created_at desc, p.id",
+  price_asc: "p.price, p.id",
+  price_desc: "p.price desc, p.id",
+};
+
 export async function getProducts(p: CatalogParams = {}) {
-  const supabase = await createClient();
   const page = Math.max(1, p.page ?? 1);
-  const needVariants = Boolean(p.sizes?.length || p.colors?.length);
-  let query = supabase
-    .from("products")
-    .select(needVariants ? `${CARD}, product_variants!inner(size,color)` : CARD, { count: "exact" })
-    .eq("is_active", true);
-
+  const where = ["p.is_active = 1"];
+  const args: (string | number)[] = [];
   if (p.category) {
-    const { data: cat } = await supabase.from("categories").select("id").eq("slug", p.category).maybeSingle();
+    const cat = await one<{ id: string }>(db(), "select id from categories where slug = ?", [p.category]);
     if (!cat) return { items: [] as Product[], total: 0, page };
-    query = query.eq("category_id", cat.id);
+    where.push("p.category_id = ?"); args.push(cat.id);
   }
-  if (p.q && clean(p.q)) query = query.or(`name.ilike.%${clean(p.q)}%,description.ilike.%${clean(p.q)}%,brand.ilike.%${clean(p.q)}%`);
-  if (p.brands?.length) query = query.in("brand", p.brands);
-  if (p.sizes?.length) query = query.in("product_variants.size", p.sizes);
-  if (p.colors?.length) query = query.in("product_variants.color", p.colors);
-  if (p.min !== undefined) query = query.gte("price", p.min);
-  if (p.max !== undefined) query = query.lte("price", p.max);
-
-  const sort = p.sort ?? "popular";
-  if (sort === "price_asc") query = query.order("price");
-  else if (sort === "price_desc") query = query.order("price", { ascending: false });
-  else if (sort === "new") query = query.order("created_at", { ascending: false });
-  else query = query.order("is_featured", { ascending: false }).order("created_at", { ascending: false });
-
-  const from = (page - 1) * PAGE_SIZE;
-  const { data, count, error } = await query
-    .order("sort_order", { referencedTable: "product_images" })
-    .range(from, from + PAGE_SIZE - 1);
-  if (error) throw new Error(error.message);
-  return { items: (data ?? []) as unknown as Product[], total: count ?? 0, page };
+  if (p.q?.trim()) { where.push("p.search like ? escape '\\'"); args.push(likeTerm(p.q.trim())); }
+  if (p.brands?.length) { where.push(`p.brand in (${placeholders(p.brands.length)})`); args.push(...p.brands); }
+  if (p.min !== undefined) { where.push("p.price >= ?"); args.push(p.min); }
+  if (p.max !== undefined) { where.push("p.price <= ?"); args.push(p.max); }
+  if (p.sizes?.length || p.colors?.length) {
+    const v = ["v.product_id = p.id"];
+    if (p.sizes?.length) { v.push(`v.size in (${placeholders(p.sizes.length)})`); args.push(...p.sizes); }
+    if (p.colors?.length) { v.push(`v.color in (${placeholders(p.colors.length)})`); args.push(...p.colors); }
+    where.push(`exists (select 1 from product_variants v where ${v.join(" and ")})`);
+  }
+  const clause = where.join(" and ");
+  const total = (await one<{ n: number }>(db(), `select count(*) n from products p where ${clause}`, args))!.n;
+  const rows = await all(
+    db(),
+    `select p.* from products p where ${clause} order by ${ORDER[p.sort ?? "popular"] ?? ORDER.popular} limit ? offset ?`,
+    [...args, PAGE_SIZE, (page - 1) * PAGE_SIZE],
+  );
+  return { items: await hydrateProducts(rows), total, page };
 }
 
 /** Секции главной: рекомендуемые, новинки, скидки. */
 export async function getHomeProducts() {
-  const supabase = await createClient();
-  const base = () =>
-    supabase.from("products").select(CARD).eq("is_active", true).order("sort_order", { referencedTable: "product_images" });
-  const [featured, fresh, sale] = await Promise.all([
-    base().eq("is_featured", true).order("created_at", { ascending: false }).limit(8),
-    base().eq("is_new", true).order("created_at", { ascending: false }).limit(4),
-    base().not("old_price", "is", null).order("created_at", { ascending: false }).limit(4),
-  ]);
-  const err = featured.error ?? fresh.error ?? sale.error;
-  if (err) throw new Error(err.message);
-  return {
-    featured: featured.data as unknown as Product[],
-    fresh: fresh.data as unknown as Product[],
-    sale: sale.data as unknown as Product[],
-  };
+  const pick = async (cond: string, limit: number) =>
+    hydrateProducts(await all(db(), `select * from products where is_active = 1 and ${cond} order by created_at desc, id limit ?`, [limit]));
+  const [featured, fresh, sale] = await Promise.all([pick("is_featured = 1", 8), pick("is_new = 1", 4), pick("old_price is not null", 4)]);
+  return { featured, fresh, sale };
 }
 
 export const getFacets = cache(async () => {
-  const supabase = await createClient();
-  const { data, error } = await supabase.rpc("catalog_facets");
-  if (error) throw new Error(error.message);
-  const f = data as { brands: string[]; sizes: string[]; colors: { name: string; hex: string }[]; min: number; max: number };
+  const [brands, sizes, colors, price] = await Promise.all([
+    all<{ brand: string }>(db(), "select distinct brand from products where is_active = 1 order by brand"),
+    all<{ size: string }>(db(), "select distinct v.size from product_variants v join products p on p.id = v.product_id where v.is_active = 1 and p.is_active = 1"),
+    all<{ name: string; hex: string }>(db(), "select v.color name, v.color_hex hex from product_variants v join products p on p.id = v.product_id where v.is_active = 1 and p.is_active = 1 group by v.color order by v.color"),
+    one<{ lo: number | null; hi: number | null }>(db(), "select min(price) lo, max(price) hi from products where is_active = 1"),
+  ]);
   const order = ["XS", "S", "M", "L", "XL"];
   const rank = (x: string) => order.indexOf(x);
-  const sizes = [...f.sizes].sort((a, b) =>
+  const names = sizes.map((s) => s.size).sort((a, b) =>
     rank(a) >= 0 && rank(b) >= 0 ? rank(a) - rank(b) : rank(a) >= 0 ? -1 : rank(b) >= 0 ? 1 : a.localeCompare(b, "ru", { numeric: true }));
-  return { ...f, sizes };
+  return { brands: brands.map((b) => b.brand), sizes: names, colors, min: Math.floor(price?.lo ?? 0), max: Math.ceil(price?.hi ?? 0) };
 });
 
 export const getProduct = cache(async (slug: string): Promise<ProductFull | null> => {
-  const supabase = await createClient();
-  const { data, error } = await supabase
-    .from("products")
-    .select(`${CARD}, product_variants(id,sku,size,color,color_hex,is_active,inventory(quantity))`)
-    .eq("slug", slug)
-    .eq("is_active", true)
-    .order("sort_order", { referencedTable: "product_images" })
-    .maybeSingle();
-  if (error) throw new Error(error.message);
-  return data as unknown as ProductFull | null;
+  const row = await one(db(), "select * from products where slug = ? and is_active = 1", [slug]);
+  return row ? (await hydrateProducts([row], true))[0] : null;
 });
 
 export async function getRelated(product: Product) {
-  const supabase = await createClient();
-  const { data, error } = await supabase
-    .from("products")
-    .select(CARD)
-    .eq("is_active", true)
-    .eq("category_id", product.category_id)
-    .neq("id", product.id)
-    .order("is_featured", { ascending: false })
-    .order("sort_order", { referencedTable: "product_images" })
-    .limit(4);
-  if (error) throw new Error(error.message);
-  return data as unknown as Product[];
+  return hydrateProducts(
+    await all(db(), "select * from products where is_active = 1 and category_id = ? and id <> ? order by is_featured desc, created_at desc limit 4", [product.category_id, product.id]),
+  );
 }

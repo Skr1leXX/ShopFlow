@@ -132,7 +132,7 @@ export function RoleSelect({ id, role, self }: { id: string; role: "customer" | 
   );
 }
 
-/** Загрузка, замена и удаление фото товара (Supabase Storage). */
+/** Загрузка, замена и удаление фото товара (Vercel Blob). */
 export function ProductImages({ productId, images }: { productId: string; images: ProductImage[] }) {
   const { pending, error, exec } = useRun();
   const { confirm, dialog } = useConfirm();

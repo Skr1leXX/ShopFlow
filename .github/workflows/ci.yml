@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, turso]
   pull_request:
 
 permissions:
@@ -21,22 +21,19 @@ jobs:
       - run: npm run typecheck
       - run: npm run lint
       - run: npm run test:unit
-      - run: npm run db:bundle:check
+      # Бизнес-логика на настоящей libSQL (файл в памяти): секреты и облачная база не нужны.
       - run: npm run test:db
       - run: npm run scan:secrets
-      # Сборка без секретов: приложению нужны только публичные переменные, а без них оно показывает инструкцию.
+      # Сборка без секретов: без адреса базы приложение показывает инструкцию по настройке.
       - run: npm run build
       - run: npm run test:static
 
-  # Включается переменной репозитория E2E_ENABLED=true и секретами тестового (не боевого!) проекта Supabase.
+  # Полный e2e на временной файловой базе SQLite: ни секретов, ни облачных сервисов не требуется.
   e2e:
-    if: ${{ vars.E2E_ENABLED == 'true' }}
     needs: verify
     runs-on: ubuntu-latest
     env:
-      NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.E2E_SUPABASE_URL }}
-      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.E2E_SUPABASE_ANON_KEY }}
-      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.E2E_SUPABASE_SERVICE_ROLE_KEY }}
+      TURSO_DATABASE_URL: file:e2e.db
       CI: "true"
     steps:
       - uses: actions/checkout@v4
@@ -47,7 +44,7 @@ jobs:
       - run: npm ci
       - run: npx playwright install --with-deps chromium
       - run: npm run build
-      - run: npx playwright test
+      - run: npx playwright test --project=desktop
       - if: failure()
         uses: actions/upload-artifact@v4
         with:

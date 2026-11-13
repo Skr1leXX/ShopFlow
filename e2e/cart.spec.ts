@@ -1,9 +1,10 @@
 import { expect, test, type Page } from "@playwright/test";
-import { admin, readState, resetCustomerData, setStockDirect } from "./support/db";
+import { randomUUID } from "node:crypto";
+import { readState, resetCustomerData, setStockDirect, sqlRows, sqlRun, sqlVal } from "./support/db";
 import { hasBackend } from "./support/env";
 import { addToCartOnProduct, login, normalize, trackErrors } from "./support/helpers";
 
-test.skip(!hasBackend, "нужен проект Supabase (см. e2e/README.md)");
+test.skip(!hasBackend, "нужна база данных (TURSO_DATABASE_URL, см. e2e/README.md)");
 test.describe.configure({ mode: "serial" });
 
 const total = async (page: Page) => normalize(await page.locator("aside dl").innerText());
@@ -61,9 +62,7 @@ test.describe("корзина гостя", () => {
     const s = readState();
     await resetCustomerData(s.customer.id);
     // Сначала в корзине пользователя уже есть кепка (из другой «сессии»), у гостя — кепка и куртка.
-    const db = admin();
-    const { data: cart } = await db.from("carts").select("id").eq("user_id", s.customer.id).single();
-    await db.from("cart_items").insert({ cart_id: cart!.id, variant_id: s.products.cap.variantM, quantity: 1 });
+    await sqlRun("insert into cart_items (id, user_id, variant_id, quantity) values (?, ?, ?, 1)", [randomUUID(), s.customer.id, s.products.cap.variantM]);
 
     await addToCartOnProduct(page, s.products.cap.slug);
     await addToCartOnProduct(page, s.products.jacket.slug);
@@ -71,14 +70,14 @@ test.describe("корзина гостя", () => {
 
     await expect(page.getByRole("link", { name: s.products.jacket.name })).toBeVisible();
     await expect(page.getByRole("link", { name: s.products.cap.name })).toBeVisible();
-    const { data: items } = await db.from("cart_items").select("variant_id,quantity").eq("cart_id", cart!.id);
-    expect(items!.find((i) => i.variant_id === s.products.cap.variantM)?.quantity).toBe(2); // 1 + 1 суммируются
-    expect(items!.find((i) => i.variant_id === s.products.jacket.variantM)?.quantity).toBe(1);
+    const items = await sqlRows("select variant_id, quantity from cart_items where user_id = ?", [s.customer.id]);
+    expect(items.find((i) => i.variant_id === s.products.cap.variantM)?.quantity).toBe(2); // 1 + 1 суммируются
+    expect(items.find((i) => i.variant_id === s.products.jacket.variantM)?.quantity).toBe(1);
     // гостевая корзина очищена и повторно не добавляется
     expect(await page.evaluate(() => localStorage.getItem("shopflow:guest-cart"))).toBe("[]");
     await page.reload();
-    const { data: after } = await db.from("cart_items").select("quantity").eq("cart_id", cart!.id);
-    expect(after!.reduce((n, i) => n + i.quantity, 0)).toBe(3);
+    const after = await sqlRows("select quantity from cart_items where user_id = ?", [s.customer.id]);
+    expect(after.reduce((n, i) => n + i.quantity, 0)).toBe(3);
   });
 });
 
@@ -91,22 +90,21 @@ test.describe("корзина пользователя", () => {
 
   test("добавление, изменение, удаление и хранение в базе после перезагрузки", async ({ page }) => {
     const s = readState();
-    const db = admin();
     await addToCartOnProduct(page, s.products.tee.slug);
     await page.goto("/cart");
     await page.getByRole("button", { name: "Больше" }).click();
     await expect.poll(async () => total(page)).toContain("4 000 ₽");
 
-    const { data } = await db.from("cart_items").select("quantity, carts!inner(user_id)").eq("carts.user_id", s.customer.id);
+    const data = await sqlRows("select quantity from cart_items where user_id = ?", [s.customer.id]);
     expect(data).toHaveLength(1);
-    expect(data![0].quantity).toBe(2); // изменение сохранено в БД, а не в браузере
+    expect(data[0].quantity).toBe(2); // изменение сохранено в БД, а не в браузере
 
     await page.reload();
     expect(await total(page)).toContain("4 000 ₽");
 
     await page.getByRole("button", { name: "Удалить" }).click();
     await expect(page.getByRole("heading", { name: "Корзина пуста" })).toBeVisible();
-    const { count } = await db.from("cart_items").select("id, carts!inner(user_id)", { count: "exact", head: true }).eq("carts.user_id", s.customer.id);
+    const count = await sqlVal("select count(*) from cart_items where user_id = ?", [s.customer.id]);
     expect(count).toBe(0);
   });
 
@@ -137,8 +135,8 @@ test.describe("корзина пользователя", () => {
       await expect(page.getByText("Доступно только 1 шт.")).toBeVisible();
       await expect(page.getByText("Уменьшите количество или удалите")).toBeVisible();
       await expect(page.getByRole("link", { name: "Оформить заказ" })).toHaveCount(0);
-      const r = await page.goto("/checkout");
-      expect(r?.url()).toMatch(/\/cart$/); // сервер не даёт открыть оформление
+      await page.goto("/checkout");
+      await expect(page).toHaveURL(/\/cart$/); // сервер не даёт открыть оформление
     } finally {
       await setStockDirect(s.products.cap.variantM, 20);
     }

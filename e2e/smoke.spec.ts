@@ -1,9 +1,9 @@
 import { expect, test } from "@playwright/test";
 import { hasBackend } from "./support/env";
 
-// Проверки без бэкенда: приложение корректно ведёт себя без настроенного Supabase и отдаёт безопасные заголовки.
+// Проверки без бэкенда: приложение корректно ведёт себя без настроенной базы и отдаёт безопасные заголовки.
 // При наличии бэкенда эти же заголовки проверяет perf.spec.ts.
-test.describe("приложение без настроенного Supabase", () => {
+test.describe("приложение без настроенной базы данных", () => {
   test.skip(hasBackend, "бэкенд настроен: см. остальные сценарии");
 
   test("главная показывает инструкцию по подключению, а не падает", async ({ page }) => {
@@ -11,15 +11,15 @@ test.describe("приложение без настроенного Supabase", (
     page.on("pageerror", (e) => errors.push(e.message));
     const r = await page.goto("/");
     expect(r?.status()).toBe(200);
-    await expect(page.getByRole("heading", { name: "Подключите Supabase" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Подключите базу данных" })).toBeVisible();
     expect(errors).toEqual([]);
   });
 
-  for (const path of ["/login", "/register", "/forgot-password", "/catalog", "/cart", "/admin"]) {
+  for (const path of ["/login", "/register", "/catalog", "/cart", "/admin"]) {
     test(`${path}: инструкция, без 5xx`, async ({ page }) => {
       const r = await page.goto(path);
       expect(r?.status()).toBeLessThan(500);
-      await expect(page.getByText("Подключите Supabase")).toBeVisible();
+      await expect(page.getByText("Подключите базу данных")).toBeVisible();
     });
   }
 
@@ -44,7 +44,7 @@ test.describe("приложение без настроенного Supabase", (
     expect(h["permissions-policy"]).toContain("camera=()");
     expect(h["x-powered-by"]).toBeUndefined();
     const html = await r.text();
-    expect(html).not.toMatch(/service_role|SUPABASE_SERVICE_ROLE_KEY|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\./);
+    expect(html).not.toMatch(/TURSO_AUTH_TOKEN|BLOB_READ_WRITE_TOKEN|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\./);
   });
 
   test("мобильная вёрстка заглушки без горизонтальной прокрутки", async ({ page }) => {

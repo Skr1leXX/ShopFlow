@@ -1,63 +1,93 @@
 import "server-only";
-import { createClient } from "@/lib/supabase/server";
-import { CARD } from "./catalog";
-import type { Address, CartLine, Order, Product } from "./types";
+import { db } from "@/lib/db";
+import { getUser } from "@/lib/auth";
+import { all, flag, placeholders, type Row } from "@/lib/core/db";
+import { hydrateProducts } from "./shape";
+import type { Address, CartLine, Order, OrderItem, Product } from "./types";
 
-// Все запросы идут от имени пользователя: RLS отдаёт только его корзину, избранное, адреса и заказы.
+// Без RLS каждая выборка явно ограничена пользователем из сессии (userId): чужие данные запросом не достать.
+async function me() {
+  return (await getUser())?.id ?? null; // гостю принадлежит пустой набор данных, а не ошибка
+}
 
 export async function getCart(): Promise<CartLine[]> {
-  const supabase = await createClient();
-  const { data, error } = await supabase
-    .from("cart_items")
-    .select(`id, quantity, variant:product_variants(id,sku,size,color,color_hex,is_active,inventory(quantity), products(${CARD}))`)
-    .order("id");
-  if (error) throw new Error(error.message);
-  return (data as unknown as CartLine[]).filter((l) => l.variant?.is_active && l.variant.products?.is_active);
+  const userId = await me();
+  if (!userId) return [];
+  const rows = await all(
+    db(),
+    `select ci.id, ci.quantity, pv.id vid, pv.product_id, pv.sku, pv.size, pv.color, pv.color_hex, pv.is_active v_active, i.quantity stock
+     from cart_items ci join product_variants pv on pv.id = ci.variant_id left join inventory i on i.variant_id = pv.id
+     where ci.user_id = ? order by ci.id`,
+    [userId],
+  );
+  if (!rows.length) return [];
+  const pids = [...new Set(rows.map((r) => r.product_id as string))];
+  const products = new Map(
+    (await hydrateProducts(await all(db(), `select * from products where id in (${placeholders(pids.length)})`, pids))).map((p) => [p.id, p]),
+  );
+  return rows
+    .map((r) => ({
+      id: r.id as string, quantity: r.quantity as number,
+      variant: {
+        id: r.vid as string, sku: r.sku as string, size: r.size as string, color: r.color as string, color_hex: r.color_hex as string,
+        is_active: flag(r.v_active), inventory: r.stock === null ? null : { quantity: r.stock as number },
+        products: products.get(r.product_id as string)!,
+      },
+    }))
+    .filter((l) => l.variant.is_active && l.variant.products?.is_active);
 }
 
 export async function getCartCount() {
-  const supabase = await createClient();
-  const { data } = await supabase.from("cart_items").select("quantity");
-  return (data ?? []).reduce((s, r) => s + r.quantity, 0);
+  const userId = await me();
+  if (!userId) return 0;
+  const rows = await all<{ n: number | null }>(db(), "select sum(quantity) n from cart_items where user_id = ?", [userId]);
+  return rows[0]?.n ?? 0;
 }
 
 export async function getFavoriteIds(): Promise<Set<string>> {
-  const supabase = await createClient();
-  const { data } = await supabase.from("favorites").select("product_id");
-  return new Set((data ?? []).map((r) => r.product_id));
+  const userId = await me();
+  if (!userId) return new Set();
+  const rows = await all<{ product_id: string }>(db(), "select product_id from favorites where user_id = ?", [userId]);
+  return new Set(rows.map((r) => r.product_id));
 }
 
 export async function getFavoriteProducts(): Promise<Product[]> {
-  const supabase = await createClient();
-  const { data, error } = await supabase
-    .from("favorites")
-    .select(`created_at, product:products(${CARD})`)
-    .order("created_at", { ascending: false });
-  if (error) throw new Error(error.message);
-  return (data as unknown as { product: Product | null }[]).map((r) => r.product).filter((p): p is Product => !!p?.is_active);
+  const userId = await me();
+  if (!userId) return [];
+  const rows = await all(
+    db(), "select p.* from favorites f join products p on p.id = f.product_id where f.user_id = ? and p.is_active = 1 order by f.created_at desc", [userId],
+  );
+  return hydrateProducts(rows);
 }
 
 export async function getAddresses(): Promise<Address[]> {
-  const supabase = await createClient();
-  const { data, error } = await supabase
-    .from("addresses")
-    .select("*")
-    .order("is_default", { ascending: false })
-    .order("created_at");
-  if (error) throw new Error(error.message);
-  return data as Address[];
+  const userId = await me();
+  if (!userId) return [];
+  const rows = await all(db(), "select * from addresses where user_id = ? order by is_default desc, created_at", [userId]);
+  return rows.map((r) => ({ ...(r as unknown as Address), is_default: flag(r.is_default) }));
+}
+
+/** Собирает заказы с позициями и разбирает JSON адреса. */
+export async function hydrateOrders(rows: Row[]): Promise<Order[]> {
+  if (!rows.length) return [];
+  const items = await all<OrderItem & { order_id: string }>(
+    db(), `select * from order_items where order_id in (${placeholders(rows.length)}) order by rowid`, rows.map((r) => r.id as string),
+  );
+  return rows.map((r) => ({
+    ...(r as unknown as Order),
+    shipping_address: (() => { try { return JSON.parse(String(r.shipping_address)); } catch { return {}; } })(),
+    order_items: items.filter((i) => i.order_id === r.id),
+  }));
 }
 
 export async function getMyOrders(): Promise<Order[]> {
-  const supabase = await createClient();
-  const { data, error } = await supabase.from("orders").select("*, order_items(*)").order("created_at", { ascending: false });
-  if (error) throw new Error(error.message);
-  return data as unknown as Order[];
+  const userId = await me();
+  if (!userId) return [];
+  return hydrateOrders(await all(db(), "select * from orders where user_id = ? order by created_at desc", [userId]));
 }
 
 export async function getOrder(id: string): Promise<Order | null> {
-  const supabase = await createClient();
-  const { data, error } = await supabase.from("orders").select("*, order_items(*)").eq("id", id).maybeSingle();
-  if (error) throw new Error(error.message);
-  return data as unknown as Order | null;
+  const userId = await me();
+  if (!userId) return null;
+  return (await hydrateOrders(await all(db(), "select * from orders where id = ? and user_id = ?", [id, userId])))[0] ?? null;
 }
